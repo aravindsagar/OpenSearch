@@ -37,6 +37,8 @@ import org.opensearch.index.engine.exec.coord.IndexFileDeleter;
 import org.opensearch.index.engine.exec.coord.Segment;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.search.aggregations.SearchResultsCollector;
+import com.carrotsearch.randomizedtesting.ThreadFilter;
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.plugins.spi.vectorized.DataFormat;
 
@@ -51,7 +53,21 @@ import static org.opensearch.datafusion.search.cache.CacheSettings.STATISTICS_CA
 import static org.opensearch.datafusion.search.cache.CacheSettings.STATISTICS_CACHE_SIZE_LIMIT;
 import static org.opensearch.index.engine.Engine.SearcherScope.INTERNAL;
 
+@ThreadLeakFilters(defaultFilters = true, filters = { DataFusionReaderManagerTests.DataFusionThreadFilter.class })
 public class DataFusionReaderManagerTests extends OpenSearchTestCase {
+
+    /**
+     * Excludes Tokio worker threads from randomizedtesting's thread leak detection.
+     * These threads (datafusion-io-* and datafusion-cpu-*) are intentional process-lifetime
+     * infrastructure created by the global RuntimeManager. They are not resource leaks.
+     */
+    public static class DataFusionThreadFilter implements ThreadFilter {
+        @Override
+        public boolean reject(Thread t) {
+            return t.getName().startsWith("datafusion-");
+        }
+    }
+
     private static DataFusionService service;
     Supplier<IndexFileDeleter> noOpFileDeleterSupplier;
 
@@ -468,7 +484,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
 
     private void verifySearchResults(DatafusionSearcher searcher, DatafusionQuery datafusionQuery, Map<String, Long> expectedResults) throws Exception {
         Map<String, Object[]> finalRes = new HashMap<>();
-        searcher.searchAsync(datafusionQuery, service.getRuntimePointer()).whenComplete((streamPointer, error)-> {
+        searcher.searchAsync(datafusionQuery, service.getRuntimePointer()).whenCompleteAsync((streamPointer, error)-> {
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
             RecordBatchStream stream = new RecordBatchStream(streamPointer, service.getRuntimePointer(), allocator);
 
