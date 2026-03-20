@@ -28,6 +28,8 @@ import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.datafusion.jni.NativeBridge;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -84,6 +86,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 
@@ -305,7 +308,31 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
             context.getDatafusionQuery().setQueryPlanExplainEnabled(context.evaluateSearchQueryExplainMode());
             context.getDatafusionQuery().setTargetPartitionsCount(context.getTargetMaxSliceCount());
 
+            // Register a cancellation hook so that any cancellation signal (HTTP disconnect,
+            // _tasks/_cancel, timeout) immediately fires the Rust CancellationToken. Without
+            // this, the token is only fired at the next loadNextBatch() boundary, meaning
+            // DataFusion keeps running through the entire executeQueryPhaseAsync setup phase.
+            long contextId = context.getContextId();
+            SearchShardTask task = context.getTask();
+            if (task != null) {
+                task.setCancellationListener(() -> NativeBridge.cancelQuery(contextId));
+            }
+
             datafusionSearcher.searchAsync(context.getDatafusionQuery(), datafusionService.getRuntimePointer()).whenCompleteAsync((streamPointer, error)-> {
+                // Execution finished (success or error) — remove the hook so the task object
+                // does not hold a reference to NativeBridge after the query is done.
+                if (task != null) {
+                    task.clearCancellationListener();
+                }
+                // If the future completed exceptionally, propagate to the listener so the
+                // HTTP request is not left hanging. Throwing from whenCompleteAsync's BiConsumer
+                // only fails the returned CompletableFuture (which nobody holds), it does NOT
+                // call listener.onFailure().
+                if (error != null) {
+                    Throwable cause = error instanceof CompletionException ? error.getCause() : error;
+                    listener.onFailure(cause instanceof Exception ? (Exception) cause : new RuntimeException(cause));
+                    return;
+                }
                 Map<String, List<Object>> finalResColumns = new HashMap<>();
                 List<Long> rowIdResult = new ArrayList<>();
                 if(streamPointer == null) {
@@ -377,6 +404,14 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
         AsyncRecordBatchIterator iterator = new AsyncRecordBatchIterator(stream);
         iterator.nextAsync(ActionListener.wrap(hasMore -> {
             if (hasMore) {
+                if (context.isCancelled()) {
+                    // Fire the Rust cancellation token so any future streamNext calls return
+                    // EOF immediately, then let cleanup close the stream via the normal path.
+                    NativeBridge.cancelQuery(context.getContextId());
+                    cleanup(stream, allocator);
+                    listener.onFailure(new TaskCancelledException("DataFusion query cancelled: " + context.getContextId()));
+                    return;
+                }
                 try {
                     collector.collect(stream);
                     // Recursively load next batch - TODO : anyway to Change this to iteration ?

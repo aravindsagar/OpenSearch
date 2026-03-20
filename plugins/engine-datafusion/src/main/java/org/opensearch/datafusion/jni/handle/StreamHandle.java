@@ -82,7 +82,7 @@ public final class StreamHandle extends NativeHandle {
                                                     CDataDictionaryProvider dictionaryProvider) {
         long runtimePointer = this.runtimePtr;
         CompletableFuture<Boolean> result = new CompletableFuture<>();
-        NativeBridge.streamNext(runtimePointer, ptr, new ActionListener<Long>() {
+        NativeBridge.streamNext(runtimePointer, ptr, taskId, new ActionListener<Long>() {
             @Override
             public void onResponse(Long arrowArrayAddress) {
                 if (arrowArrayAddress == 0) {

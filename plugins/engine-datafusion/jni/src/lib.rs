@@ -284,21 +284,16 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_startToki
         }
     };
 
-    // Uncomment this to monitor tokio metrics
-
-    // let io_runtime = manager.io_runtime.clone();
-    // io_runtime.spawn(async move {
-    //     let handle = tokio::runtime::Handle::current();
-    //     let runtime_monitor = RuntimeMonitor::new(&handle);
-    //
-    //     // Monitor at 120-second intervals
-    //     for metrics in runtime_monitor.intervals() {
-    //         log_runtime_metrics(&metrics);
-    //         tokio::time::sleep(Duration::from_secs(120)).await;
-    //     }
-    // });
-    //
-    // println!("Runtime monitoring started");
+    let io_runtime = manager.io_runtime.clone();
+    io_runtime.spawn(async move {
+        let handle = tokio::runtime::Handle::current();
+        let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&handle);
+        log_info!("Tokio runtime monitoring started (interval: 5s)");
+        for metrics in runtime_monitor.intervals() {
+            log_runtime_metrics(&metrics);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 }
 
 /// Log runtime metrics with performance analysis
@@ -307,6 +302,7 @@ fn log_runtime_metrics(metrics: &tokio_metrics::RuntimeMetrics) {
     log_info!("=== Runtime Metrics ===");
     log_info!("  Workers: {}", metrics.workers_count);
     log_info!("  Global queue depth: {}", metrics.global_queue_depth);
+    log_info!("  Active queries (ACTIVE_QUERIES): {}", ACTIVE_QUERIES.len());
     /*
     //unstable tokio causes build failures, uncomment this when monitoring
 
@@ -719,33 +715,41 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
     let table_path = shard_view.table_path();
     let files_meta = shard_view.files_metadata();
 
-    // Register this query in the active-queries map before spawning.
-    // The entry lives until streamClose (success path) or until the
-    // async task returns an error (failure path, handled below).
-    ACTIVE_QUERIES.insert(task_id, QueryContext::new());
+    // Register this query in the active-queries map before spawning, creating a fresh
+    // CancellationToken. The token is raced against setup work via select! below so
+    // that cancelQuery() can interrupt the query before a stream is returned to Java.
+    let token = CancellationToken::new();
+    ACTIVE_QUERIES.insert(task_id, QueryContext { cancellation_token: token.clone() });
 
     spawn_jni_task(
         &io_runtime,
         "executeQueryPhaseAsync",
         listener_ref,
         async move {
-            let result = query_executor::execute_query_with_cross_rt_stream(
-                table_path,
-                files_meta,
-                table_name,
-                plan_bytes_vec,
-                is_query_plan_explain_enabled,
-                target_partitions,
-                runtime,
-                cpu_executor,
-                task_id,
-            ).await;
-            // If the query phase failed, no stream will be returned to Java,
-            // so streamClose will never be called — deregister here instead.
-            if result.is_err() {
-                ACTIVE_QUERIES.remove(&task_id);
+            tokio::select! {
+                result = query_executor::execute_query_with_cross_rt_stream(
+                    table_path,
+                    files_meta,
+                    table_name,
+                    plan_bytes_vec,
+                    is_query_plan_explain_enabled,
+                    target_partitions,
+                    runtime,
+                    cpu_executor,
+                    task_id,
+                ) => {
+                    // If the query phase failed, no stream will be returned to Java,
+                    // so streamClose will never be called — deregister here instead.
+                    if result.is_err() {
+                        ACTIVE_QUERIES.remove(&task_id);
+                    }
+                    result
+                }
+                _ = token.cancelled() => {
+                    ACTIVE_QUERIES.remove(&task_id);
+                    Err(DataFusionError::Execution(format!("Query {} cancelled", task_id)))
+                }
             }
-            result
         },
         |env, lr, ptr| set_action_listener_ok_global(env, lr, ptr),
     );
@@ -798,6 +802,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_streamNex
     _class: JClass,
     runtime_ptr: jlong,
     stream: jlong,
+    task_id: jlong,
     listener: JObject,
 ) {
     let manager = match TOKIO_RUNTIME_MANAGER.get() {
@@ -834,14 +839,20 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_streamNex
         listener_ref,
         async move {
             let stream = unsafe { &mut *(stream_ptr as *mut RecordBatchStreamAdapter<CrossRtStream>) };
-            // Poll the stream with monitoring
-            let result = stream.try_next().await?;
-
-            // Uncomment for monitoring stream next
-            // let result = STREAM_NEXT_MONITOR.instrument(async {
-            //         stream.try_next().await
-            // }).await;
-            match result {
+            // Look up the cancellation token and race try_next against it.
+            // If the token fires, return EOF (0) immediately so Java's loadNextBatch()
+            // completes with false and the batch loop exits naturally, after which
+            // streamClose is called safely from the normal exit path.
+            let token = ACTIVE_QUERIES.get(&task_id).map(|ctx| ctx.cancellation_token.clone());
+            let maybe_batch = if let Some(token) = token {
+                tokio::select! {
+                    result = STREAM_NEXT_MONITOR.instrument(stream.try_next()) => result?,
+                    _ = token.cancelled() => return Ok(0),
+                }
+            } else {
+                STREAM_NEXT_MONITOR.instrument(stream.try_next()).await?
+            };
+            match maybe_batch {
                 Some(batch) => {
                     log_info!("[RUST streamNext] Batch produced: {} rows, {} columns, schema: {:?}",
                         batch.num_rows(), batch.num_columns(), batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>());
@@ -912,6 +923,15 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeFe
 
     let table_path = shard_view.table_path();
     let files_metadata = shard_view.files_metadata();
+
+    // Skip execution if this query was already cancelled before the fetch phase begins.
+    if ACTIVE_QUERIES.get(&task_id).map_or(false, |ctx| ctx.cancellation_token.is_cancelled()) {
+        let _ = env.throw_new(
+            "java/lang/RuntimeException",
+            format!("Fetch phase skipped: query {} cancelled", task_id),
+        );
+        return 0;
+    }
 
     let include_fields: Vec<String> =
         parse_string_arr(&mut env, include_fields).expect("Expected list of files");
@@ -1166,6 +1186,23 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeIn
             log_error!("Indexed query execution failed: {}", e);
             set_action_listener_error(&mut env, listener, &e);
         }
+    }
+}
+
+/// Signals cancellation for the query registered under the given task ID.
+/// The cancellation token is picked up by the select! in executeQueryPhaseAsync
+/// and streamNext, causing them to return early to Java.
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_cancelQuery(
+    _env: JNIEnv,
+    _class: JClass,
+    task_id: jlong,
+) {
+    if let Some(ctx) = ACTIVE_QUERIES.get(&task_id) {
+        ctx.cancellation_token.cancel();
+        log_info!("Cancelled query with task_id={}", task_id);
+    } else {
+        log_info!("cancelQuery called for unknown/completed task_id={}", task_id);
     }
 }
 

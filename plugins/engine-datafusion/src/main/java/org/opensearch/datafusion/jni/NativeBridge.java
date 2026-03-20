@@ -45,9 +45,12 @@ public final class NativeBridge {
     public static native void fetchSegmentStats(long readerPtr, ActionListener<Map<String, FileStats>> listener);
 
     // Stream operations
-    public static native void streamNext(long runtime, long stream, ActionListener<Long> listener);
+    public static native void streamNext(long runtime, long stream, long taskId, ActionListener<Long> listener);
     public static native void streamGetSchema(long stream, ActionListener<Long> listener);
     public static native void streamClose(long stream, long taskId);
+
+    // Cancellation
+    public static native void cancelQuery(long taskId);
 
     // Cache management
     public static native long createCustomCacheManager();

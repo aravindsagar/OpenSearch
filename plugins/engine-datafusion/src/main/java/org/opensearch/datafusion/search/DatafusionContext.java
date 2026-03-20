@@ -62,6 +62,7 @@ import org.opensearch.search.query.ReduceableSearchResult;
 import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
 import org.opensearch.search.suggest.SuggestionSearchContext;
+import org.opensearch.datafusion.jni.NativeBridge;
 import org.opensearch.vectorized.execution.search.spi.QueryResult;
 import org.opensearch.vectorized.execution.search.spi.RecordBatchStream;
 
@@ -197,16 +198,20 @@ public class DatafusionContext extends SearchContext {
 
     @Override
     public SearchShardTask getTask() {
-        return null;
+        return task;
     }
 
     @Override
     public boolean isCancelled() {
-        return false;
+        return task != null && task.isCancelled();
     }
 
     @Override
     protected void doClose() {
+        // Signal cancellation to any in-flight Rust tasks for this query.
+        // If executeQueryPhaseAsync or streamNext are in flight, their select! will fire
+        // and return early to Java, after which the normal exit path calls streamClose.
+        NativeBridge.cancelQuery(getContextId());
         Releasables.close(engineSearcher);
         originalContext.close();
     }
