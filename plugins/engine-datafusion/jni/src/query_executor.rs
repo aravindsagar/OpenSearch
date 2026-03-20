@@ -113,6 +113,7 @@ pub async fn execute_query_with_cross_rt_stream(
     target_partitions: usize,
     runtime: &DataFusionRuntime,
     cpu_executor: DedicatedExecutor,
+    task_id: i64,
 ) -> Result<jlong, DataFusionError> {
     let object_meta: Arc<Vec<ObjectMeta>> = Arc::new(
         files_meta
@@ -285,7 +286,23 @@ pub async fn execute_query_with_cross_rt_stream(
         clone_df.show().await?;
     }
 
-    let df_stream = match execute_stream(physical_plan, ctx.task_ctx()) {
+    // Build a TaskContext that carries our ShardSearchContextId as task_id.
+    // DataFusion operators emit this in their debug log lines, enabling
+    // correlation between DF-internal traces and the OpenSearch query that
+    // triggered them.
+    let task_ctx = {
+        let state = ctx.state();
+        Arc::new(TaskContext::new(
+            Some(task_id.to_string()),
+            state.session_id().to_string(),
+            state.config().clone(),
+            state.scalar_functions().clone(),
+            state.aggregate_functions().clone(),
+            state.window_functions().clone(),
+            Arc::clone(state.runtime_env()),
+        ))
+    };
+    let df_stream = match execute_stream(physical_plan, task_ctx) {
         Ok(stream) => stream,
         Err(e) => {
             error!("Failed to create execution stream: {}", e);
@@ -352,6 +369,7 @@ pub async fn execute_fetch_phase(
     exclude_fields: Vec<String>,
     runtime: &DataFusionRuntime,
     cpu_executor: DedicatedExecutor,
+    task_id: i64,
 ) -> Result<jlong, DataFusionError> {
     // Create optimized Parquet access plans for targeted row retrieval
     // This converts absolute row IDs back to file-relative positions and creates
@@ -463,7 +481,15 @@ pub async fn execute_fetch_phase(
     let projection_exec = Arc::new(ProjectionExec::try_new(projection_exprs, parquet_exec)
         .expect("Failed to create ProjectionExec"));
     let optimized_plan: Arc<dyn ExecutionPlan> = projection_exec.clone();
-    let task_ctx = Arc::new(TaskContext::default());
+    let task_ctx = Arc::new(TaskContext::new(
+        Some(task_id.to_string()),
+        "fetch-phase".to_string(),
+        SessionConfig::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        Arc::new(RuntimeEnvBuilder::new().build()?),
+    ));
     let stream = optimized_plan.execute(0, task_ctx)?;
 
     Ok(get_cross_rt_stream(cpu_executor, stream))

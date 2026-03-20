@@ -38,8 +38,8 @@ public final class NativeBridge {
     public static native void shutdownTokioRuntimeManager();
 
     // Query execution
-    public static native void executeQueryPhaseAsync(long readerPtr, String tableName, byte[] plan, boolean isQueryPlanExplainEnabled, int partitionCount, long runtimePtr, ActionListener<Long> listener);
-    public static native long executeFetchPhase(long readerPtr, long[] rowIds, String[] includeFields, String[] excludeFields, long runtimePtr);
+    public static native void executeQueryPhaseAsync(long readerPtr, String tableName, byte[] plan, boolean isQueryPlanExplainEnabled, int partitionCount, long runtimePtr, long taskId, ActionListener<Long> listener);
+    public static native long executeFetchPhase(long readerPtr, long[] rowIds, String[] includeFields, String[] excludeFields, long runtimePtr, long taskId);
 
     // File Stats
     public static native void fetchSegmentStats(long readerPtr, ActionListener<Map<String, FileStats>> listener);
@@ -47,7 +47,7 @@ public final class NativeBridge {
     // Stream operations
     public static native void streamNext(long runtime, long stream, ActionListener<Long> listener);
     public static native void streamGetSchema(long stream, ActionListener<Long> listener);
-    public static native void streamClose(long stream);
+    public static native void streamClose(long stream, long taskId);
 
     // Cache management
     public static native long createCustomCacheManager();
@@ -62,6 +62,8 @@ public final class NativeBridge {
     public static native void destroyCustomCacheManager(long cacheManagerPointer);
     // For testing-purposes only
     public static native boolean cacheManagerGetItemByCacheType(long cacheManagerPointer, String cacheType, String filePath);
+    /** For testing only: returns the number of in-flight queries registered in ACTIVE_QUERIES. */
+    public static native long getActiveQueryCount();
 
 
     // Reader management

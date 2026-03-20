@@ -129,6 +129,7 @@ public class DatafusionContext extends SearchContext {
         this.task = task;
         this.readEngine = engine;
         this.engineSearcher = (DatafusionSearcher) readerContext.acquireSearcher("search");
+        this.engineSearcher.setTaskId(readerContext.id().getId());
         this.queryResult = new QuerySearchResult(readerContext.id(), searchShardTarget, request);
         this.fetchResult = new FetchSearchResult(readerContext.id(), searchShardTarget);
         this.indexService = readerContext.indexService();
@@ -230,7 +231,15 @@ public class DatafusionContext extends SearchContext {
 
     @Override
     public ShardSearchContextId id() {
-        return null;
+        return readerContext.id();
+    }
+
+    /**
+     * Returns the ShardSearchContextId long, used as the stable task identifier
+     * when threading context through JNI into Rust.
+     */
+    public long getContextId() {
+        return readerContext.id().getId();
     }
 
     @Override

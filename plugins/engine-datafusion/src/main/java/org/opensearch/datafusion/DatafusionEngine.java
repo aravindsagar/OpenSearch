@@ -247,7 +247,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
         RecordBatchStream stream = null;
 
         try {
-            stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer(), rootAllocator);
+            stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer(), context.getContextId(), rootAllocator);
 
             // We can have some collectors passed like this which can collect the results and convert to InternalAggregation
             // Is the possible? need to check
@@ -332,7 +332,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
     private void collect(DatafusionContext context, Executor executor, ActionListener<QueryResult> listener, Long streamPointer, Map<String, List<Object>> finalRes, List<Long> rowIdResult) {
         RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-        RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer() , allocator);
+        RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer(), context.getContextId(), allocator);
         SearchResultsCollector<RecordBatchStream> collector = new SearchResultsCollector<RecordBatchStream>() {
             @Override
             public void collect(RecordBatchStream value) {
@@ -450,7 +450,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
         context.getDatafusionQuery().setSource(includeFields, excludeFields);
         DatafusionSearcher datafusionSearcher = context.getEngineSearcher();
         long streamPointer = datafusionSearcher.search(context.getDatafusionQuery(), datafusionService.getRuntimePointer());
-        RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer(), rootAllocator);
+        RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getRuntimePointer(), context.getContextId(), rootAllocator);
 
         Map<Long, Integer> rowIdToIndex = new HashMap<>();
         for (int idx = 0; idx < rowIds.size(); idx++) {

@@ -57,6 +57,8 @@ pub mod logger;
 // Import logger macros from shared crate
 use vectorized_exec_spi::{log_info, log_error, log_debug};
 
+use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
 use crate::custom_cache_manager::CustomCacheManager;
 use crate::util::{create_file_meta_from_filenames, parse_string_arr, set_action_listener_error, set_action_listener_error_global, set_action_listener_ok, set_action_listener_ok_global, set_action_listener_ok_global_with_map};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, TrackConsumersPool};
@@ -98,6 +100,30 @@ static QUERY_EXECUTION_MONITOR: Lazy<TaskMonitor> = Lazy::new(|| {
 static STREAM_NEXT_MONITOR: Lazy<TaskMonitor> = Lazy::new(|| {
     TaskMonitor::with_slow_poll_threshold(Duration::from_micros(50)).clone()
 });
+
+/// Per-query context stored in the ACTIVE_QUERIES registry.
+/// Keyed by the ShardSearchContextId long (passed from Java as task_id).
+/// Entries are inserted when executeQueryPhaseAsync begins and removed
+/// when streamClose is called (or when the query phase errors before
+/// returning a stream).
+pub struct QueryContext {
+    /// Token used to signal cancellation for this query.
+    /// Currently the only field; more observability handles will be added here.
+    pub cancellation_token: CancellationToken,
+}
+
+impl QueryContext {
+    fn new() -> Self {
+        Self {
+            cancellation_token: CancellationToken::new(),
+        }
+    }
+}
+
+/// Registry of all in-flight queries on this node, keyed by ShardSearchContextId.
+/// dashmap is already a declared dependency; tokio_util::sync::CancellationToken
+/// is the only new addition.
+static ACTIVE_QUERIES: Lazy<DashMap<i64, QueryContext>> = Lazy::new(DashMap::new);
 
 // Global runtime manager
 static TOKIO_RUNTIME_MANAGER: OnceLock<Arc<RuntimeManager>> = OnceLock::new();
@@ -636,6 +662,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
     is_query_plan_explain_enabled: jboolean,
     target_partitions: jint,
     runtime_ptr: jlong,
+    task_id: jlong,
     listener: JObject,
 ) {
     let manager = match TOKIO_RUNTIME_MANAGER.get() {
@@ -692,20 +719,34 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
     let table_path = shard_view.table_path();
     let files_meta = shard_view.files_metadata();
 
+    // Register this query in the active-queries map before spawning.
+    // The entry lives until streamClose (success path) or until the
+    // async task returns an error (failure path, handled below).
+    ACTIVE_QUERIES.insert(task_id, QueryContext::new());
+
     spawn_jni_task(
         &io_runtime,
         "executeQueryPhaseAsync",
         listener_ref,
-        query_executor::execute_query_with_cross_rt_stream(
-            table_path,
-            files_meta,
-            table_name,
-            plan_bytes_vec,
-            is_query_plan_explain_enabled,
-            target_partitions,
-            runtime,
-            cpu_executor,
-        ),
+        async move {
+            let result = query_executor::execute_query_with_cross_rt_stream(
+                table_path,
+                files_meta,
+                table_name,
+                plan_bytes_vec,
+                is_query_plan_explain_enabled,
+                target_partitions,
+                runtime,
+                cpu_executor,
+                task_id,
+            ).await;
+            // If the query phase failed, no stream will be returned to Java,
+            // so streamClose will never be called — deregister here instead.
+            if result.is_err() {
+                ACTIVE_QUERIES.remove(&task_id);
+            }
+            result
+        },
         |env, lr, ptr| set_action_listener_ok_global(env, lr, ptr),
     );
 }
@@ -863,6 +904,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeFe
     include_fields: JObjectArray,
     exclude_fields: JObjectArray,
     runtime_ptr: jlong,
+    task_id: jlong,
     callback: JObject,
 ) -> jlong {
     let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
@@ -933,6 +975,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeFe
             exclude_fields,
             runtime,
             cpu_executor,
+            task_id,
         ).await {
             Ok(stream_ptr) => stream_ptr,
             Err(e) => {
@@ -951,7 +994,11 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_streamClo
     _env: JNIEnv,
     _class: JClass,
     stream: jlong,
+    task_id: jlong,
 ) {
+    // Deregister the query from the active-queries map. This is the normal
+    // completion path (both end-of-stream and early close / cancellation).
+    ACTIVE_QUERIES.remove(&task_id);
     let _ = unsafe { Box::from_raw(stream as *mut RecordBatchStreamAdapter<CrossRtStream>) };
 }
 
@@ -1119,5 +1166,85 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeIn
             log_error!("Indexed query execution failed: {}", e);
             set_action_listener_error(&mut env, listener, &e);
         }
+    }
+}
+
+/// Returns the number of currently registered in-flight queries.
+/// Intended for testing only — not part of the production API.
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_getActiveQueryCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    ACTIVE_QUERIES.len() as jlong
+}
+
+#[cfg(test)]
+mod active_queries_tests {
+    use super::*;
+
+    #[test]
+    fn test_insert_and_remove() {
+        let id: i64 = 99001;
+        // Ensure clean state
+        ACTIVE_QUERIES.remove(&id);
+
+        ACTIVE_QUERIES.insert(id, QueryContext::new());
+        assert!(ACTIVE_QUERIES.contains_key(&id), "entry should be present after insert");
+
+        ACTIVE_QUERIES.remove(&id);
+        assert!(!ACTIVE_QUERIES.contains_key(&id), "entry should be absent after remove");
+    }
+
+    #[test]
+    fn test_remove_nonexistent_is_noop() {
+        let id: i64 = 99002;
+        ACTIVE_QUERIES.remove(&id);
+        // Removing again should not panic
+        ACTIVE_QUERIES.remove(&id);
+    }
+
+    #[test]
+    fn test_cancellation_token_is_not_cancelled_initially() {
+        let id: i64 = 99003;
+        ACTIVE_QUERIES.remove(&id);
+
+        ACTIVE_QUERIES.insert(id, QueryContext::new());
+        let is_cancelled = ACTIVE_QUERIES
+            .get(&id)
+            .map(|ctx| ctx.cancellation_token.is_cancelled())
+            .unwrap_or(false);
+        assert!(!is_cancelled, "token should not be cancelled on creation");
+
+        ACTIVE_QUERIES.remove(&id);
+    }
+
+    #[test]
+    fn test_multiple_queries_have_independent_tokens() {
+        let id_a: i64 = 99004;
+        let id_b: i64 = 99005;
+        ACTIVE_QUERIES.remove(&id_a);
+        ACTIVE_QUERIES.remove(&id_b);
+
+        ACTIVE_QUERIES.insert(id_a, QueryContext::new());
+        ACTIVE_QUERIES.insert(id_b, QueryContext::new());
+
+        // Cancel only query A
+        if let Some(ctx) = ACTIVE_QUERIES.get(&id_a) {
+            ctx.cancellation_token.cancel();
+        }
+
+        let a_cancelled = ACTIVE_QUERIES.get(&id_a)
+            .map(|ctx| ctx.cancellation_token.is_cancelled())
+            .unwrap_or(false);
+        let b_cancelled = ACTIVE_QUERIES.get(&id_b)
+            .map(|ctx| ctx.cancellation_token.is_cancelled())
+            .unwrap_or(false);
+
+        assert!(a_cancelled, "query A token should be cancelled");
+        assert!(!b_cancelled, "query B token should remain uncancelled");
+
+        ACTIVE_QUERIES.remove(&id_a);
+        ACTIVE_QUERIES.remove(&id_b);
     }
 }

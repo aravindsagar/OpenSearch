@@ -42,6 +42,8 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.plugins.spi.vectorized.DataFormat;
 
+import org.opensearch.datafusion.jni.NativeBridge;
+
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
@@ -421,6 +423,56 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         searcher2.close();
     }
 
+    /**
+     * Verifies that ACTIVE_QUERIES is populated when a query starts and cleaned up when the stream is closed.
+     * Uses NativeBridge.getActiveQueryCount() to inspect the native registry from Java.
+     */
+    public void testActiveQueriesRegistryLifecycle() throws Exception {
+        ShardPath shardPath = createShardPathWithResourceFiles("index-7", 0, "parquet_file_generation_0.parquet");
+        DatafusionEngine engine = new DatafusionEngine(DataFormat.PARQUET, Collections.emptyList(), service, shardPath);
+        DatafusionReaderManager readerManager = engine.getReferenceManager(INTERNAL);
+
+        Path parquetDir = shardPath.getDataPath().resolve("parquet");
+        Segment segment = new Segment(0);
+        WriterFileSet writerFileSet = new WriterFileSet(parquetDir, 0, 2);
+        writerFileSet.add(parquetDir + "/parquet_file_generation_0.parquet");
+        segment.addSearchableFiles(getMockDataFormat().name(), writerFileSet);
+
+        readerManager.afterRefresh(true,
+            () -> getCatalogSnapshotRef(new CompositeEngineCatalogSnapshot(1, 1, List.of(segment), new HashMap<>(), noOpFileDeleterSupplier)));
+
+        DatafusionSearcher searcher = engine.acquireSearcher("test-registry");
+        // Use a distinct non-zero taskId to isolate this test from others that use the default taskId=0
+        final long testTaskId = 999_001L;
+        searcher.setTaskId(testTaskId);
+
+        byte[] protoContent;
+        try (InputStream is = getClass().getResourceAsStream("/substrait_plan_test.pb")) {
+            protoContent = is.readAllBytes();
+        }
+
+        long countBefore = NativeBridge.getActiveQueryCount();
+
+        DatafusionQuery datafusionQuery = new DatafusionQuery("index-7", protoContent, new java.util.ArrayList<>());
+        long streamPointer = searcher.searchAsync(datafusionQuery, service.getRuntimePointer()).join();
+        RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        RecordBatchStream stream = new RecordBatchStream(streamPointer, service.getRuntimePointer(), searcher.getTaskId(), allocator);
+
+        long countDuringQuery = NativeBridge.getActiveQueryCount();
+        assertTrue("ACTIVE_QUERIES should have at least one entry during query execution",
+            countDuringQuery > countBefore);
+
+        // Drain the stream fully so streamClose is called
+        while (stream.loadNextBatch().join()) { /* consume */ }
+        stream.close();
+
+        long countAfter = NativeBridge.getActiveQueryCount();
+        assertEquals("ACTIVE_QUERIES entry should be removed after stream close",
+            countBefore, countAfter);
+
+        searcher.close();
+    }
+
     // ========== Helper Methods ==========
 
     private int getRefCount(DatafusionReader reader) {
@@ -486,35 +538,37 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         Map<String, Object[]> finalRes = new HashMap<>();
         searcher.searchAsync(datafusionQuery, service.getRuntimePointer()).whenCompleteAsync((streamPointer, error)-> {
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-            RecordBatchStream stream = new RecordBatchStream(streamPointer, service.getRuntimePointer(), allocator);
-
-            SearchResultsCollector<RecordBatchStream> collector = new SearchResultsCollector<RecordBatchStream>() {
-                @Override
-                public void collect(RecordBatchStream value) {
-                    VectorSchemaRoot root = value.getVectorSchemaRoot();
-                    for (Field field : root.getSchema().getFields()) {
-                        String filedName = field.getName();
-                        FieldVector fieldVector = root.getVector(filedName);
-                        Object[] fieldValues = new Object[fieldVector.getValueCount()];
-                        for (int i = 0; i < fieldVector.getValueCount(); i++) {
-                            fieldValues[i] = fieldVector.getObject(i);
+            try (RecordBatchStream stream = new RecordBatchStream(streamPointer, service.getRuntimePointer(), searcher.getTaskId(), allocator)) {
+                SearchResultsCollector<RecordBatchStream> collector = new SearchResultsCollector<RecordBatchStream>() {
+                    @Override
+                    public void collect(RecordBatchStream value) {
+                        VectorSchemaRoot root = value.getVectorSchemaRoot();
+                        for (Field field : root.getSchema().getFields()) {
+                            String filedName = field.getName();
+                            FieldVector fieldVector = root.getVector(filedName);
+                            Object[] fieldValues = new Object[fieldVector.getValueCount()];
+                            for (int i = 0; i < fieldVector.getValueCount(); i++) {
+                                fieldValues[i] = fieldVector.getObject(i);
+                            }
+                            finalRes.put(filedName, fieldValues);
                         }
-                        finalRes.put(filedName, fieldValues);
+                    }
+                };
+
+                while (stream.loadNextBatch().join()) {
+                    try {
+                        collector.collect(stream);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
                     }
                 }
-            };
 
-            while (stream.loadNextBatch().join()) {
-                try {
-                    collector.collect(stream);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
+                for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
+                    logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
+                    assertEquals(Long.valueOf(entry.getValue()[0].toString()), expectedResults.get(entry.getKey()));
                 }
-            }
-
-            for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
-                logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
-                assertEquals(Long.valueOf(entry.getValue()[0].toString()), expectedResults.get(entry.getKey()));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
             }
         }).join();
     }

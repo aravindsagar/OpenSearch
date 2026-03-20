@@ -34,10 +34,11 @@ public class RecordBatchStream implements Closeable {
      * Creates a new RecordBatchStream for the given stream pointer
      * @param streamId the stream pointer
      * @param runtimePtr the runtime pointer
+     * @param taskId the ShardSearchContextId long, forwarded to streamClose for ACTIVE_QUERIES cleanup
      * @param parentAllocator parent allocator to create child from
      */
-    public RecordBatchStream(long streamId, long runtimePtr, BufferAllocator parentAllocator) {
-        this.streamHandle = new StreamHandle(streamId, runtimePtr);
+    public RecordBatchStream(long streamId, long runtimePtr, long taskId, BufferAllocator parentAllocator) {
+        this.streamHandle = new StreamHandle(streamId, runtimePtr, taskId);
         this.allocator = parentAllocator.newChildAllocator("stream-" + streamId, 0, Long.MAX_VALUE);
         this.dictionaryProvider = new CDataDictionaryProvider();
         this.schemaFuture = streamHandle.getSchema(allocator, dictionaryProvider)
