@@ -196,7 +196,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// appropriate `set_action_listener_ok_*` variant. `T` is inferred from
 /// the closure, which in turn pins the `Output` type of `task`.
 fn spawn_jni_task<Fut, T, FOk>(
-    runtime: &Arc<Runtime>,
+    runtime: &tokio::runtime::Handle,
     task_name: &'static str,
     listener_ref: GlobalRef,
     task: Fut,
@@ -1202,7 +1202,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_cancelQue
         ctx.cancellation_token.cancel();
         log_info!("Cancelled query with task_id={}", task_id);
     } else {
-        log_info!("cancelQuery called for unknown/completed task_id={}", task_id);
+        log_debug!("cancelQuery called for unknown/completed task_id={}", task_id);
     }
 }
 
