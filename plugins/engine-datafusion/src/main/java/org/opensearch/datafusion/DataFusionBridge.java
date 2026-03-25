@@ -38,6 +38,7 @@ import java.io.Closeable;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -55,6 +56,14 @@ import java.util.stream.Collectors;
 public class DataFusionBridge implements EngineBridge<byte[], DataFusionResultStream, RelNode>, Closeable {
 
     private static final Logger logger = LogManager.getLogger(DataFusionBridge.class);
+
+    /**
+     * Generates unique negative task IDs for bridge-path queries (i.e. queries that
+     * come through the analytics framework rather than through a SearchShardTask).
+     * Negative values guarantee no collision with positive ShardSearchContextId values
+     * used by the search path.
+     */
+    private static final AtomicLong BRIDGE_TASK_ID_COUNTER = new AtomicLong(-1L);
 
     private static volatile SimpleExtension.ExtensionCollection EXTENSIONS;
 
@@ -196,6 +205,9 @@ public class DataFusionBridge implements EngineBridge<byte[], DataFusionResultSt
      */
     @Override
     public DataFusionResultStream execute(byte[] fragment) {
+        // Unique negative ID keeps this query isolated in ACTIVE_QUERIES without
+        // colliding with positive ShardSearchContextId values from the search path.
+        long taskId = BRIDGE_TASK_ID_COUNTER.getAndDecrement();
         CompletableFuture<Long> future = new CompletableFuture<>();
         NativeBridge.executeQueryPhaseAsync(
             reader.getReaderPtr(),
@@ -204,6 +216,7 @@ public class DataFusionBridge implements EngineBridge<byte[], DataFusionResultSt
             false,    // isQueryPlanExplainEnabled
             0,        // partitionCount — use engine default
             runtimePointer,
+            taskId,
             new ActionListener<Long>() {
                 @Override
                 public void onResponse(Long streamPointer) {
@@ -223,7 +236,7 @@ public class DataFusionBridge implements EngineBridge<byte[], DataFusionResultSt
         } catch (Exception e) {
             throw new RuntimeException("Failed to execute query phase", e);
         }
-        return new DataFusionResultStream(streamPointer, runtimePointer, allocator);
+        return new DataFusionResultStream(streamPointer, runtimePointer, taskId, allocator);
     }
 
     @Override
