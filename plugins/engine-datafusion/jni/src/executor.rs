@@ -281,6 +281,58 @@ impl DedicatedExecutor {
             .boxed()
     }
 
+    /// Like [`spawn`], but also returns a [`tokio::task::AbortHandle`] that can abort
+    /// the cpu task independently of dropping the returned future.
+    ///
+    /// The task is spawned immediately (synchronously) when this method is called —
+    /// not lazily on first `.await`. The caller can store the `AbortHandle` and call
+    /// `abort()` to cancel the task at its next `await` point without waiting for the
+    /// result future to be dropped.
+    ///
+    /// Returns `None` for the handle when the executor is shutting down (`WorkerGone`).
+    pub fn spawn_with_abort_handle<T>(
+        &self,
+        task: T,
+    ) -> (BoxFuture<'static, Result<T::Output, JobError>>, Option<tokio::task::AbortHandle>)
+    where
+        T: Future + Send + 'static,
+        T::Output: Send + 'static,
+    {
+        let handle = {
+            let state = self.state.read();
+            state.handle.clone()
+        };
+
+        let Some(handle) = handle else {
+            return (futures::future::err(JobError::WorkerGone).boxed(), None);
+        };
+
+        let mut join_set = JoinSet::new();
+        let abort_handle = join_set.spawn_on(task, &handle);
+        let fut = async move {
+            join_set
+                .join_next()
+                .await
+                .expect("just spawned task")
+                .map_err(|e| match e.try_into_panic() {
+                    Ok(e) => {
+                        let s = if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown internal error".to_string()
+                        };
+                        JobError::Panic { msg: s }
+                    }
+                    Err(_) => JobError::WorkerGone,
+                })
+        }
+        .boxed();
+
+        (fut, Some(abort_handle))
+    }
+
     /// Stops all subsequent task executions, and waits for the worker
     /// thread to complete. Note this will shutdown all clones of this
     /// `DedicatedExecutor` as well.

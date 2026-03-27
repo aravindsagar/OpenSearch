@@ -72,7 +72,8 @@ use crate::absolute_row_id_optimizer::{AbsoluteRowIdOptimizer, ROW_BASE_FIELD_NA
 /// * `cpu_executor` - Dedicated executor for CPU-intensive operations
 ///
 /// # Returns
-/// A pointer (as jlong) to the cross-runtime stream that can be consumed from Java/JNI
+/// `(stream_ptr, Option<AbortHandle>)` — a raw pointer to the cross-runtime stream and
+/// an abort handle that can cancel the cpu task before `streamClose` is called.
 ///
 /// # Process Overview
 /// 1. Sets up file caching and runtime environment for optimal performance
@@ -114,7 +115,7 @@ pub async fn execute_query_with_cross_rt_stream(
     runtime: &DataFusionRuntime,
     cpu_executor: DedicatedExecutor,
     task_id: i64,
-) -> Result<jlong, DataFusionError> {
+) -> Result<(jlong, Option<tokio::task::AbortHandle>), DataFusionError> {
     let object_meta: Arc<Vec<ObjectMeta>> = Arc::new(
         files_meta
             .iter()
@@ -313,8 +314,13 @@ pub async fn execute_query_with_cross_rt_stream(
     Ok(get_cross_rt_stream(cpu_executor, df_stream))
 }
 
-pub fn get_cross_rt_stream(cpu_executor: DedicatedExecutor, df_stream: SendableRecordBatchStream) -> jlong {
-    let cross_rt_stream = CrossRtStream::new_with_df_error_stream(
+/// Wraps a DataFusion stream in a `CrossRtStream` and returns a raw pointer for JNI
+/// handoff alongside an `AbortHandle` for early cpu-task cancellation.
+pub fn get_cross_rt_stream(
+    cpu_executor: DedicatedExecutor,
+    df_stream: SendableRecordBatchStream,
+) -> (jlong, Option<tokio::task::AbortHandle>) {
+    let (cross_rt_stream, abort_handle) = CrossRtStream::new_with_df_error_stream(
         df_stream,
         cpu_executor,
     );
@@ -324,7 +330,7 @@ pub fn get_cross_rt_stream(cpu_executor: DedicatedExecutor, df_stream: SendableR
         cross_rt_stream,
     );
 
-    Box::into_raw(Box::new(wrapped_stream)) as jlong
+    (Box::into_raw(Box::new(wrapped_stream)) as jlong, abort_handle)
 }
 
 /// Executes the fetch phase of a two-phase query execution strategy.
@@ -492,7 +498,9 @@ pub async fn execute_fetch_phase(
     ));
     let stream = optimized_plan.execute(0, task_ctx)?;
 
-    Ok(get_cross_rt_stream(cpu_executor, stream))
+    // Fetch phase uses block_on and cannot be interrupted mid-execution; discard abort handle.
+    let (stream_ptr, _abort_handle) = get_cross_rt_stream(cpu_executor, stream);
+    Ok(stream_ptr)
 }
 
 fn is_aggs_query(plan: &LogicalPlan) -> bool {

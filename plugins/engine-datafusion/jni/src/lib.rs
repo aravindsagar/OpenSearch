@@ -108,14 +108,21 @@ static STREAM_NEXT_MONITOR: Lazy<TaskMonitor> = Lazy::new(|| {
 /// returning a stream).
 pub struct QueryContext {
     /// Token used to signal cancellation for this query.
-    /// Currently the only field; more observability handles will be added here.
     pub cancellation_token: CancellationToken,
+    /// Handle for the cpu_executor task driving the CrossRtStream.
+    /// Set after executeQueryPhaseAsync succeeds (the task is spawned eagerly inside
+    /// CrossRtStream::new_with_df_error_stream). Calling abort() cancels the task at
+    /// its next await point, freeing the cpu thread immediately without waiting for
+    /// Java to call streamClose (which does the same via JoinSet drop).
+    /// None until the stream is created, and None when the executor is shutting down.
+    pub cpu_abort_handle: OnceLock<tokio::task::AbortHandle>,
 }
 
 impl QueryContext {
     fn new() -> Self {
         Self {
             cancellation_token: CancellationToken::new(),
+            cpu_abort_handle: OnceLock::new(),
         }
     }
 }
@@ -719,7 +726,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
     // CancellationToken. The token is raced against setup work via select! below so
     // that cancelQuery() can interrupt the query before a stream is returned to Java.
     let token = CancellationToken::new();
-    ACTIVE_QUERIES.insert(task_id, QueryContext { cancellation_token: token.clone() });
+    ACTIVE_QUERIES.insert(task_id, QueryContext { cancellation_token: token.clone(), cpu_abort_handle: OnceLock::new() });
 
     spawn_jni_task(
         &io_runtime,
@@ -738,12 +745,24 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
                     cpu_executor,
                     task_id,
                 ) => {
-                    // If the query phase failed, no stream will be returned to Java,
-                    // so streamClose will never be called — deregister here instead.
-                    if result.is_err() {
-                        ACTIVE_QUERIES.remove(&task_id);
+                    match result {
+                        Ok((stream_ptr, abort_handle)) => {
+                            // Store the cpu task's AbortHandle so cancelQuery() can abort it
+                            // immediately without waiting for Java to call streamClose.
+                            if let (Some(handle), Some(ctx)) =
+                                (abort_handle, ACTIVE_QUERIES.get(&task_id))
+                            {
+                                let _ = ctx.cpu_abort_handle.set(handle);
+                            }
+                            Ok(stream_ptr)
+                        }
+                        Err(e) => {
+                            // Query phase failed — no stream returned to Java, so
+                            // streamClose will never be called; deregister here instead.
+                            ACTIVE_QUERIES.remove(&task_id);
+                            Err(e)
+                        }
                     }
-                    result
                 }
                 _ = token.cancelled() => {
                     ACTIVE_QUERIES.remove(&task_id);
@@ -1200,7 +1219,15 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_cancelQue
 ) {
     if let Some(ctx) = ACTIVE_QUERIES.get(&task_id) {
         ctx.cancellation_token.cancel();
-        log_info!("Cancelled query with task_id={}", task_id);
+        // If the cpu task is already running, abort it immediately so the
+        // cpu_executor thread is freed without waiting for Java to call streamClose
+        // (which would achieve the same via JoinSet::abort_all on driver drop).
+        if let Some(handle) = ctx.cpu_abort_handle.get() {
+            handle.abort();
+            log_info!("Cancelled query with task_id={} (cpu task aborted)", task_id);
+        } else {
+            log_info!("Cancelled query with task_id={} (cpu task not yet started)", task_id);
+        }
     } else {
         log_debug!("cancelQuery called for unknown/completed task_id={}", task_id);
     }

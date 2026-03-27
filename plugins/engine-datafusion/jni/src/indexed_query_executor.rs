@@ -122,5 +122,6 @@ pub async fn execute_indexed_query_stream(
     eprintln!("[INDEXED-TIMING] setup={}ms, plan={}ms, execute_stream={}ms, explain={}",
         t_setup.as_millis(), (t_plan - t_setup).as_millis(), (t_exec - t_plan).as_millis(), is_query_plan_explain_enabled);
 
-    Ok(get_cross_rt_stream(cpu_executor, df_stream))
+    let (stream_ptr, _abort_handle) = get_cross_rt_stream(cpu_executor, df_stream);
+    Ok(stream_ptr)
 }

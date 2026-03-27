@@ -97,11 +97,13 @@ impl CrossRtStream {
     /// # How it works
     ///
     /// 1. Captures the source stream's schema
-    /// 2. Spawns a task on the dedicated executor that:
-    ///    - Polls the source stream
-    ///    - Sends each result through the channel
-    ///    - Stops if the channel is closed (consumer dropped)
-    /// 3. Wraps the spawned task to handle executor errors (panics, shutdown)
+    /// 2. Spawns a task **eagerly** on the dedicated executor (the task starts running
+    ///    immediately, not lazily on first poll). This allows the cpu task to begin
+    ///    producing batches into the MPSC channel right away, and — crucially — gives
+    ///    back an [`tokio::task::AbortHandle`] that the caller can use to cancel the
+    ///    task without waiting for the stream to be dropped.
+    /// 3. Returns `(Self, Option<AbortHandle>)` so the caller can store the handle for
+    ///    early cancellation. `None` is returned only when the executor is shutting down.
     ///
     /// # Arguments
     ///
@@ -110,48 +112,53 @@ impl CrossRtStream {
     pub fn new_with_df_error_stream(
         stream: SendableRecordBatchStream,
         exec: DedicatedExecutor,
-    ) -> Self {
+    ) -> (Self, Option<tokio::task::AbortHandle>) {
         let schema = stream.schema();
+        let (tx, rx) = channel(1);
+        let tx_captured = tx.clone();
 
-        Self::new_with_tx(
-            |tx| {
-                // Clone the sender for the inner task
-                let tx_captured = tx.clone();
+        // The inner task: pulls batches from the DataFusion stream and forwards them
+        // over the MPSC channel. Stops if the receiver is dropped (channel closed).
+        let fut = async move {
+            tokio::pin!(stream);
+            while let Some(res) = stream.next().await {
+                if tx_captured.send(res).await.is_err() {
+                    return;
+                }
+            }
+        };
 
-                // Create the inner task that pulls from the stream
-                let fut = async move {
-                    // Pin the stream to poll it
-                    tokio::pin!(stream);
+        // Spawn eagerly so we get an AbortHandle immediately. The cpu task starts
+        // running now; backpressure from the channel (capacity 1) will naturally
+        // pause it after the first batch until the io_runtime consumes it.
+        let (spawn_fut, abort_handle) = exec.spawn_with_abort_handle(fut);
 
-                    // Pull items from the stream and send them through the channel
-                    while let Some(res) = stream.next().await {
-                        // If send fails, the receiver was dropped, so stop
-                        if tx_captured.send(res).await.is_err() {
-                            return;
-                        }
+        // The driver future owns the JoinSet (via spawn_fut). Dropping it calls
+        // JoinSet::abort_all() — the drop-based cancellation path used by streamClose.
+        let driver: BoxFuture<'static, ()> = async move {
+            if let Err(e) = spawn_fut.await {
+                let err = match e {
+                    JobError::Panic { msg } => {
+                        DataFusionError::Execution(format!("Panic: {}", msg))
+                    }
+                    JobError::WorkerGone => {
+                        DataFusionError::Execution("Worker gone".to_string())
                     }
                 };
+                tx.send(Err(err)).await.ok();
+            }
+        }
+        .boxed();
 
-                // Wrap the inner task in executor error handling
-                async move {
-                    // Spawn the task on the dedicated executor
-                    if let Err(e) = exec.spawn(fut).await {
-                        // Convert executor errors to DataFusion errors
-                        let err = match e {
-                            JobError::Panic { msg } => {
-                                DataFusionError::Execution(format!("Panic: {}", msg))
-                            }
-                            JobError::WorkerGone => {
-                                DataFusionError::Execution("Worker gone".to_string())
-                            }
-                        };
-                        // Try to send the error; if it fails, the receiver is already gone
-                        tx.send(Err(err)).await.ok();
-                    }
-                }
-            },
+        let this = Self {
+            driver,
+            driver_ready: false,
+            inner: ReceiverStream::new(rx),
+            inner_done: false,
             schema,
-        )
+        };
+
+        (this, abort_handle)
     }
 
     /// Returns the Arrow schema for this stream.
