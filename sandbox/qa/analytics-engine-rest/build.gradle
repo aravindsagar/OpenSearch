@@ -27,33 +27,19 @@ dependencies {
     testImplementation project(':sandbox:plugins:dsl-query-executor')
     testImplementation project(':sandbox:plugins:composite-engine')
     testImplementation project(':sandbox:plugins:parquet-data-format')
-    testImplementation project(':sandbox:plugins:test-ppl-frontend')
 }
 
 testClusters.integTest {
-    plugin ':plugins:arrow-flight-rpc'
     plugin ':sandbox:plugins:analytics-engine'
     plugin ':sandbox:plugins:analytics-backend-datafusion'
     plugin ':sandbox:plugins:analytics-backend-lucene'
     plugin ':sandbox:plugins:dsl-query-executor'
     plugin ':sandbox:plugins:composite-engine'
     plugin ':sandbox:plugins:parquet-data-format'
-    plugin ':sandbox:plugins:test-ppl-frontend'
 
     // Arrow/Flight JVM flags for DataFusion native library
     jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
     jvmArgs '--enable-native-access=ALL-UNNAMED'
-
-    // Arrow memory allocator needs Netty unsafe access on JDK 25; mirrors
-    // gradle/run.gradle's arrow-flight-rpc overrides so AnalyticsSearchService
-    // can construct its RootAllocator at node start.
-    systemProperty 'io.netty.allocator.numDirectArenas', '1'
-    systemProperty 'io.netty.noUnsafe', 'false'
-    systemProperty 'io.netty.tryUnsafe', 'true'
-    systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
-
-    // Native library path for DataFusion
-    systemProperty 'java.library.path', "${project(':sandbox:libs:dataformat-native').ext.nativeLibPath.parent}"
 
     // Enable pluggable dataformat feature flag
     systemProperty 'opensearch.experimental.feature.pluggable.dataformat.enabled', 'true'

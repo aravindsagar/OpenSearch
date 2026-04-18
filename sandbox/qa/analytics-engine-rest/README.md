@@ -1,55 +1,28 @@
 # Analytics Engine REST Integration Tests
 
-REST-based integration tests for the analytics engine, running against a live OpenSearch cluster with sandbox plugins installed.
+REST-based integration tests for the analytics engine's DataFusion and Parquet query paths, running against a live OpenSearch cluster with sandbox plugins installed.
 
 ## Architecture
 
 ```
-AnalyticsRestTestCase           ← abstract base (cluster config, helpers)
-├── ParquetDataFusionIT         ← parquet indexing sanity + index settings validation
+DataFusionRestTestCase          ← abstract base (cluster config, helpers)
+├── ParquetDataFusionIT         ← pure parquet indexing + query end-to-end
 ├── DslClickBenchIT             ← DSL queries via _search → DataFusion
-└── PplClickBenchIT             ← PPL queries via /_analytics/ppl → DataFusion
+└── PplClickBenchIT             ← PPL queries via /_plugins/_ppl → DataFusion
 
-Dataset                         ← descriptor for a test dataset (mapping, bulk data, queries)
-DatasetProvisioner              ← provisions any dataset into a parquet-backed index
-DatasetQueryRunner              ← auto-discovers queries and runs them against a cluster
-ClickBenchTestHelper            ← ClickBench dataset constants
+ClickBenchTestFixture           ← static helper (ClickBench index provisioning, query loading)
 ```
 
-- `AnalyticsRestTestCase` — handles cluster preservation, resource loading, JSON escaping, and assertion helpers. Extend this for any new integration test.
-- `Dataset` / `DatasetProvisioner` / `DatasetQueryRunner` — generic test infrastructure. Any new dataset can plug in by adding a directory under `resources/datasets/{name}/`.
-- `ClickBenchTestHelper` — thin wrapper that declares the ClickBench dataset descriptor.
-
-## Adding a New Dataset
-
-To add a new dataset, create a directory under `src/test/resources/datasets/{name}/` with this structure:
-
-```
-datasets/
-  {name}/
-    mapping.json              # index mapping + settings
-    bulk.json                 # bulk-indexable documents (NDJSON)
-    dsl/q1.json ... qN.json   # DSL queries (auto-discovered)
-    dsl/expected/q1.json ...  # expected responses (optional)
-    ppl/q1.ppl ... qN.ppl     # PPL queries (auto-discovered)
-    ppl/expected/q1.json ...  # expected responses (optional)
-```
-
-Then declare the dataset in Java:
-
-```java
-Dataset myDataset = new Dataset("myDatasetName", "my_index_name");
-```
-
-`DatasetProvisioner.provision(client, myDataset)` creates the index with parquet data format and ingests the bulk data. `DatasetQueryRunner.discoverQueryNumbers(myDataset, "dsl")` auto-discovers all query files.
+- `DataFusionRestTestCase` — handles cluster preservation, resource loading, JSON escaping, and assertion helpers. Extend this for any new integration test.
+- `ClickBenchTestFixture` — stateless utility that provisions the ClickBench 100-row dataset. Used via composition, not inheritance.
 
 ## Test Classes
 
 | Test | Description |
 |------|-------------|
-| `ParquetDataFusionIT` | Sanity check: creates a parquet-format index, validates settings are persisted, ingests docs, runs a simple search |
+| `ParquetDataFusionIT` | Creates a parquet-format index, bulk-indexes documents, flushes, and queries via `_search` |
 | `DslClickBenchIT` | Runs ClickBench DSL queries via `_search` → dsl-query-executor → Calcite → Substrait → DataFusion |
-| `PplClickBenchIT` | Runs ClickBench PPL queries via `/_analytics/ppl` → test-ppl-frontend → analytics-engine → Calcite → Substrait → DataFusion |
+| `PplClickBenchIT` | Runs ClickBench PPL queries via `/_plugins/_ppl` → SQL plugin → analytics-engine → Calcite → Substrait → DataFusion |
 
 ## Prerequisites
 
@@ -69,21 +42,34 @@ The DataFusion backend requires a native Rust library. Build it once (re-run aft
 ./gradlew :sandbox:libs:dataformat-native:buildRustLibrary -Dsandbox.enabled=true
 ```
 
+### Publish to local Maven
+
+The `./gradlew run` command resolves plugins from Maven. Publish core + sandbox plugins:
+
+```bash
+./gradlew publishToMavenLocal -Dsandbox.enabled=true -x test -x javadoc
+```
+
+### SQL Plugin (PPL tests only)
+
+`PplClickBenchIT` requires the SQL plugin. Clone the main branch and publish:
+
+```bash
+cd sql
+./gradlew publishToMavenLocal -x test -x javadoc
+```
+
 ## Running Tests
 
-### Managed testClusters (integTest) — auto-provisioned
-
-The `integTest` task auto-starts a single-node cluster with all required plugins and runs the tests:
+### Via managed testClusters (integTest)
 
 ```bash
 ./gradlew :sandbox:qa:analytics-engine-rest:integTest -Dsandbox.enabled=true
 ```
 
-The cluster configuration (plugins, feature flag, native library path) is defined in `build.gradle` — no manual setup needed.
+### Via external cluster (restTest)
 
-### External cluster (restTest) — manually provisioned
-
-Start a cluster manually (see below), then run tests against it:
+Start a cluster manually (see below), then run:
 
 ```bash
 # Default: localhost:9200
@@ -95,41 +81,56 @@ Start a cluster manually (see below), then run tests against it:
 
 ### Starting a cluster manually
 
-```bash
-./gradlew publishToMavenLocal -Dsandbox.enabled=true -x test -x javadoc
+The native library must be on `java.library.path` for the DataFusion plugin to load:
 
+```bash
 NATIVE_LIB_DIR=$(pwd)/sandbox/libs/dataformat-native/rust/target/release
 
+# Full cluster (all plugins, parquet indexing + DataFusion + DSL)
 ./gradlew run -Dsandbox.enabled=true \
-  -PinstalledPlugins="['analytics-engine', 'parquet-data-format', 'analytics-backend-datafusion', 'analytics-backend-lucene', 'dsl-query-executor', 'composite-engine', 'test-ppl-frontend']" \
+  -PinstalledPlugins="['analytics-engine', 'parquet-data-format', 'analytics-backend-datafusion', 'analytics-backend-lucene', 'dsl-query-executor', 'composite-engine']" \
+  -Dtests.jvm.argline="-Djava.library.path=$NATIVE_LIB_DIR -Dopensearch.experimental.feature.pluggable.dataformat.enabled=true" \
+  -x javadoc -x test -x missingJavadoc
+
+# With SQL plugin (for PPL tests)
+./gradlew run -Dsandbox.enabled=true \
+  -PinstalledPlugins="['opensearch-job-scheduler', 'opensearch-sql-plugin', 'analytics-engine', 'parquet-data-format', 'analytics-backend-datafusion', 'analytics-backend-lucene', 'dsl-query-executor', 'composite-engine']" \
   -Dtests.jvm.argline="-Djava.library.path=$NATIVE_LIB_DIR -Dopensearch.experimental.feature.pluggable.dataformat.enabled=true" \
   -x javadoc -x test -x missingJavadoc
 ```
 
-Note: PPL tests via `/_analytics/ppl` require the `test-ppl-frontend` plugin. It is included in the `integTest` cluster config and can also be added to `./gradlew run` via `-PinstalledPlugins`.
-
-### Running individual tests
+### Running individual tests (against a running cluster)
 
 ```bash
-# Parquet sanity
-./gradlew :sandbox:qa:analytics-engine-rest:integTest -Dsandbox.enabled=true \
-  --tests "org.opensearch.analytics.qa.ParquetDataFusionIT"
+# Parquet end-to-end (indexing + query)
+./gradlew :sandbox:qa:analytics-engine-rest:restTest -Dsandbox.enabled=true \
+  --tests "org.opensearch.analytics.qa.ParquetDataFusionIT" \
+  -Dtests.rest.cluster=localhost:9200 -Dtests.cluster=localhost:9200 -Dtests.clustername=runTask
 
 # DSL ClickBench
-./gradlew :sandbox:qa:analytics-engine-rest:integTest -Dsandbox.enabled=true \
-  --tests "org.opensearch.analytics.qa.DslClickBenchIT"
+./gradlew :sandbox:qa:analytics-engine-rest:restTest -Dsandbox.enabled=true \
+  --tests "org.opensearch.analytics.qa.DslClickBenchIT" \
+  -Dtests.rest.cluster=localhost:9200 -Dtests.cluster=localhost:9200 -Dtests.clustername=runTask
 
-# PPL ClickBench
-./gradlew :sandbox:qa:analytics-engine-rest:integTest -Dsandbox.enabled=true \
-  --tests "org.opensearch.analytics.qa.PplClickBenchIT"
+# PPL ClickBench (requires SQL plugin)
+./gradlew :sandbox:qa:analytics-engine-rest:restTest -Dsandbox.enabled=true \
+  --tests "org.opensearch.analytics.qa.PplClickBenchIT" \
+  -Dtests.rest.cluster=localhost:9200 -Dtests.cluster=localhost:9200 -Dtests.clustername=runTask
+```
+
+## Test Resources
+
+```
+src/test/resources/clickbench/
+  parquet_hits_mapping.json   # Index mapping (ClickBench schema, 103 fields)
+  bulk.json                   # 100 documents for ClickBench tests
+  dsl/q1.json ... q43.json   # 43 ClickBench DSL queries
+  ppl/q1.ppl ... q43.ppl     # 43 ClickBench PPL queries
 ```
 
 ## Notes
 
 - Parquet indexing uses the composite data format framework: `index.composite.primary_data_format = parquet`
-- The `pluggable.dataformat.enabled` feature flag must be set at cluster startup (already configured for `integTest`)
+- The `pluggable.dataformat.enabled` feature flag must be set as a JVM system property at cluster startup
 - DSL path: `_search` → dsl-query-executor → Calcite planning → Substrait → DataFusion
-- PPL path: `/_analytics/ppl` → test-ppl-frontend → analytics-engine → Calcite → Substrait → DataFusion
-- Expected response validation (via `{language}/expected/q{N}.json`) is planned for future iterations — currently the runner only validates that responses are non-empty
-- `DslClickBenchIT` runs ClickBench Q1. Auto-discovery of all 43 DSL queries is commented out in the test (see class javadoc) because several queries exercise unsupported translators/planner rules and destabilize the shared cluster. Re-enable as support expands.
-- `PplClickBenchIT` runs ClickBench Q1 via the test-ppl-frontend plugin. Auto-discovery is commented out for the same reason as DSL.
+- PPL path: `/_plugins/_ppl` → SQL plugin → analytics-engine → Calcite → Substrait → DataFusion
