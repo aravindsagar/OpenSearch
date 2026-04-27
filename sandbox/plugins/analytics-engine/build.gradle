@@ -84,6 +84,10 @@ dependencies {
   // SLF4J — provided by arrow-flight-rpc at runtime (its api dep).
   compileOnly "org.slf4j:slf4j-api:${versions.slf4j}"
 
+  // httpcore5 — required at runtime by Calcite's Avatica JDBC driver (BuiltInConnectionProperty).
+  // Avatica-core is loaded by this plugin's classloader, so httpcore5 must be here too.
+  runtimeOnly "org.apache.httpcomponents.core5:httpcore5:${versions.httpcore5}"
+
   // Calcite code generation (optional in calcite-core POM, needed at runtime for Enumerable pipeline)
   testRuntimeOnly "org.codehaus.janino:janino:3.1.12"
   testRuntimeOnly "org.codehaus.janino:commons-compiler:3.1.12"
@@ -140,6 +144,19 @@ dependencies {
 
   // Arrow Flight streaming transport for ITs
   internalClusterTestImplementation project(':plugins:arrow-flight-rpc')
+
+  // jackson-annotations — required at runtime by jackson-databind (transitive via Calcite).
+  // Without this, child plugins that use Arrow's Schema (which triggers ObjectMapper init)
+  // fail with NoClassDefFoundError for JsonSerializeAs.
+  runtimeOnly "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+
+  // httpcore5 — Avatica's BuiltInConnectionProperty static initializer references
+  // org.apache.hc.core5.util.Timeout. Must live in this parent plugin's classloader
+  // because calcite-core/avatica-core are loaded here; child plugins (test-ppl-frontend)
+  // can't satisfy classloads triggered by parent-loaded classes.
+  runtimeOnly "org.apache.httpcomponents.core5:httpcore5:${versions.httpcore5}"
+  runtimeOnly "org.apache.httpcomponents.core5:httpcore5-h2:${versions.httpcore5}"
+  runtimeOnly "org.apache.httpcomponents.client5:httpclient5:${versions.httpclient5}"
 
   // Calcite bytecode references @Immutable from immutables — resolve at test compile time
   testCompileOnly 'org.immutables:value-annotations:2.8.8'
