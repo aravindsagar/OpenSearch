@@ -143,7 +143,18 @@ public class DefaultPlanExecutor extends HandledTransportAction<ActionRequest, A
             "analytics_query",
             new AnalyticsQueryTaskRequest(dag.queryId(), null)
         );
-        final QueryContext config = new QueryContext(dag, searchExecutor, queryTask);
+
+        // Create per-query context
+        QueryContext config = new QueryContext(dag, searchExecutor, queryTask);
+
+        // Use a future that permits blocking on transport threads. This is a temporary
+        // workaround until the full async pipeline is wired (the execute() API is synchronous).
+        PlainActionFuture<Iterable<Object[]>> future = new PlainActionFuture<>() {
+            @Override
+            protected boolean blockingAllowed() {
+                return true;
+            }
+        };
 
         // Per-query cleanup on terminal. Stage-execution cancellation on external
         // task-cancel/timeout is wired inside the Scheduler — on this path the

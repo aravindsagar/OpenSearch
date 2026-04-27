@@ -50,24 +50,16 @@ public class TestPPLTransportAction extends HandledTransportAction<PPLRequest, P
         this.threadPool = threadPool;
     }
 
-    /** Test-only constructor that accepts a pre-built {@link UnifiedQueryService}. */
-    public TestPPLTransportAction(
-        TransportService transportService,
-        ActionFilters actionFilters,
-        UnifiedQueryService unifiedQueryService,
-        ThreadPool threadPool
-    ) {
+    /** Test-only constructor that accepts a pre-built {@link UnifiedQueryService}. Runs synchronously. */
+    public TestPPLTransportAction(TransportService transportService, ActionFilters actionFilters, UnifiedQueryService unifiedQueryService) {
         super(UnifiedPPLExecuteAction.NAME, transportService, actionFilters, PPLRequest::new);
         this.unifiedQueryService = unifiedQueryService;
-        this.threadPool = threadPool;
+        this.threadPool = null;
     }
 
     @Override
     protected void doExecute(Task task, PPLRequest request, ActionListener<PPLResponse> listener) {
-        // Fork to SEARCH thread pool — DefaultPlanExecutor.execute() blocks on a future
-        // internally, which is forbidden on the transport thread.
-        // TODO: update UnifiedQueryService to consume a listener that DefaultPlanExecutor does to avoid threadpool fork
-        threadPool.executor(ThreadPool.Names.SEARCH).execute(() -> {
+        Runnable work = () -> {
             try {
                 PPLResponse response = unifiedQueryService.execute(request.getPplText());
                 listener.onResponse(response);
@@ -75,6 +67,11 @@ public class TestPPLTransportAction extends HandledTransportAction<PPLRequest, P
                 logger.error("[UNIFIED_PPL] execution failed", e);
                 listener.onFailure(e);
             }
-        });
+        };
+        if (threadPool == null) {
+            work.run();  // test path
+        } else {
+            threadPool.executor(ThreadPool.Names.SEARCH).execute(work);
+        }
     }
 }
