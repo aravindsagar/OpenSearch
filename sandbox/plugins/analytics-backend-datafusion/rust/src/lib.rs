@@ -17,6 +17,8 @@ pub mod cross_rt_stream;
 pub mod executor;
 pub mod ffm;
 pub mod io;
+pub mod local_executor;
+pub mod partition_stream;
 pub mod query_executor;
 pub mod query_tracker;
 pub mod runtime_manager;
