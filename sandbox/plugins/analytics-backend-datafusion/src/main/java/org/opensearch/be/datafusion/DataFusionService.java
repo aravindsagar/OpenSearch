@@ -86,6 +86,25 @@ public class DataFusionService extends AbstractLifecycleComponent {
         }
 
         logger.debug("DataFusion service started — memory pool {}B, spill limit {}B", memoryPoolLimit, spillMemoryLimit);
+
+        // Initialize the native circuit breaker.
+        long nodeLimitBytes = memoryPoolLimit; // TODO: derive from system memory - JVM heap - safety margin
+        NativeBridge.initCircuitBreaker(memoryPoolLimit, 1_000_000L, nodeLimitBytes);
+
+        // Register the parent check upcall so Rust can call Java's checkParentLimit in real-time.
+        try {
+            var lookup = java.lang.invoke.MethodHandles.lookup();
+            var parentChecker = lookup.findStatic(
+                org.opensearch.be.datafusion.nativelib.NativeProxyCircuitBreaker.class,
+                "checkParentFromRust",
+                java.lang.invoke.MethodType.methodType(long.class, long.class)
+            );
+            NativeBridge.registerParentCheckCallback(parentChecker);
+        } catch (Throwable t) {
+            throw new RuntimeException("Failed to register parent check callback", t);
+        }
+
+        logger.debug("Native circuit breaker initialized — limit {}B, node limit {}B, overhead 1.0", memoryPoolLimit, nodeLimitBytes);
     }
 
     @Override

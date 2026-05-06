@@ -26,6 +26,7 @@ use dashmap::DashMap;
 use log::debug;
 use once_cell::sync::Lazy;
 
+use crate::circuit_breaker;
 use datafusion::common::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 
@@ -87,6 +88,9 @@ impl MemoryPool for QueryMemoryPool {
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.track_shrink(shrink);
         self.inner.shrink(reservation, shrink);
+        if let Some(breaker) = circuit_breaker::get() {
+            breaker.release(shrink);
+        }
     }
 
     fn try_grow(
@@ -94,9 +98,36 @@ impl MemoryPool for QueryMemoryPool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> Result<(), DataFusionError> {
-        self.inner.try_grow(reservation, additional)?;
-        self.track_grow(additional);
-        Ok(())
+        // 1. Child circuit breaker check (OpenSearch semantics)
+        if let Some(breaker) = circuit_breaker::get() {
+            breaker.try_reserve(additional).map_err(|e| {
+                DataFusionError::ResourcesExhausted(e.to_encoded_string())
+            })?;
+        }
+        // 2. Node-level check (total process memory via jemalloc + Java usage)
+        if let Some(node_breaker) = circuit_breaker::get_node_breaker() {
+            if let Err(e) = node_breaker.check_node_limit(additional) {
+                // Roll back child breaker
+                if let Some(breaker) = circuit_breaker::get() {
+                    breaker.release(additional);
+                }
+                return Err(DataFusionError::ResourcesExhausted(e.to_encoded_string()));
+            }
+        }
+        // 3. Global pool hard ceiling (safety net)
+        match self.inner.try_grow(reservation, additional) {
+            Ok(()) => {
+                self.track_grow(additional);
+                Ok(())
+            }
+            Err(e) => {
+                // Roll back child breaker reservation on pool failure
+                if let Some(breaker) = circuit_breaker::get() {
+                    breaker.release(additional);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn reserved(&self) -> usize {

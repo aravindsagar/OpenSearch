@@ -75,6 +75,11 @@ public final class NativeBridge {
     private static final MethodHandle CREATE_SESSION_CONTEXT;
     private static final MethodHandle CLOSE_SESSION_CONTEXT;
     private static final MethodHandle EXECUTE_WITH_CONTEXT;
+    private static final MethodHandle INIT_CIRCUIT_BREAKER;
+    private static final MethodHandle GET_BREAKER_STATS;
+    private static final MethodHandle SET_BREAKER_LIMIT;
+    private static final MethodHandle SET_BREAKER_OVERHEAD;
+    private static final MethodHandle REGISTER_PARENT_CHECK_CALLBACK;
 
     static {
         SymbolLookup lib = NativeLibraryLoader.symbolLookup();
@@ -347,6 +352,36 @@ public final class NativeBridge {
         // Hand the five filter-tree upcall stubs to Rust now. No explicit
         // caller step required — as soon as this class is loaded, callbacks
         // are installed and `df_execute_indexed_query` can dispatch into Java.
+        INIT_CIRCUIT_BREAKER = linker.downcallHandle(
+            lib.find("df_init_circuit_breaker").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG
+            )
+        );
+
+        GET_BREAKER_STATS = linker.downcallHandle(
+            lib.find("df_get_breaker_stats").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS)
+        );
+
+        SET_BREAKER_LIMIT = linker.downcallHandle(
+            lib.find("df_set_breaker_limit").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+
+        SET_BREAKER_OVERHEAD = linker.downcallHandle(
+            lib.find("df_set_breaker_overhead").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+
+        REGISTER_PARENT_CHECK_CALLBACK = linker.downcallHandle(
+            lib.find("df_register_parent_check_callback").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)
+        );
+
         installFilterTreeCallbacks(linker);
 
         CLOSE_SESSION_CONTEXT = linker.downcallHandle(
@@ -814,4 +849,56 @@ public final class NativeBridge {
     }
 
     public static void initLogger() {}
+
+    // ---- Circuit breaker ----
+
+    /** Initialize the native circuit breaker. */
+    public static void initCircuitBreaker(long limitBytes, long overheadMillionths, long nodeLimitBytes) {
+        try (var call = new NativeCall()) {
+            call.invoke(INIT_CIRCUIT_BREAKER, limitBytes, overheadMillionths, nodeLimitBytes);
+        }
+    }
+
+    /**
+     * Register the parent check callback so Rust can upcall to Java's checkParentLimit.
+     * Must be called after the CircuitBreakerService is available.
+     *
+     * @param parentChecker a static method reference: (long bytesToReserve) -> long (0=OK, 1=tripped)
+     */
+    public static void registerParentCheckCallback(java.lang.invoke.MethodHandle parentChecker) {
+        try {
+            java.lang.foreign.Arena arena = java.lang.foreign.Arena.global();
+            java.lang.foreign.MemorySegment stub = java.lang.foreign.Linker.nativeLinker().upcallStub(
+                parentChecker,
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG),
+                arena
+            );
+            NativeCall.invokeVoid(REGISTER_PARENT_CHECK_CALLBACK, stub);
+        } catch (Throwable t) {
+            throw new RuntimeException("Failed to register parent check callback", t);
+        }
+    }
+
+    /** Read breaker stats: [limitBytes, usedBytes, trippedCount, overheadMillionths]. */
+    public static long[] getBreakerStats() {
+        try (var call = new NativeCall()) {
+            var seg = call.arena().allocate(ValueLayout.JAVA_LONG, 4);
+            call.invoke(GET_BREAKER_STATS, seg);
+            return seg.toArray(ValueLayout.JAVA_LONG);
+        }
+    }
+
+    /** Dynamically update the breaker limit. */
+    public static void setBreakerLimit(long limitBytes) {
+        try (var call = new NativeCall()) {
+            call.invoke(SET_BREAKER_LIMIT, limitBytes);
+        }
+    }
+
+    /** Dynamically update the breaker overhead. */
+    public static void setBreakerOverhead(long overheadMillionths) {
+        try (var call = new NativeCall()) {
+            call.invoke(SET_BREAKER_OVERHEAD, overheadMillionths);
+        }
+    }
 }

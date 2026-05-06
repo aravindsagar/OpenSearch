@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod cross_rt_stream;
 pub mod custom_cache_manager;
 pub mod datafusion_query_config;

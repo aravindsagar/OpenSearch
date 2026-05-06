@@ -609,3 +609,66 @@ pub unsafe extern "C" fn df_execute_with_context(
         ))
         .map_err(|e| e.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Circuit breaker FFM exports
+// ---------------------------------------------------------------------------
+
+/// Initialize the native circuit breaker. Called once during DataFusionService.doStart().
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_init_circuit_breaker(
+    limit_bytes: i64,
+    overhead_millionths: i64,
+    node_limit_bytes: i64,
+) -> i64 {
+    crate::circuit_breaker::init(limit_bytes as usize, overhead_millionths as u64)
+        .map_err(|e| e.to_string())?;
+    crate::circuit_breaker::init_node_breaker(node_limit_bytes as usize)
+        .map_err(|e| e.to_string())?;
+    Ok(0i64)
+}
+
+/// Register the Java parent check callback for real-time node-level checks.
+/// Signature of callback: (bytes_to_reserve: i64) -> i64 (0 = OK, non-zero = tripped)
+#[no_mangle]
+pub unsafe extern "C" fn df_register_parent_check_callback(
+    callback: crate::circuit_breaker::CheckParentFn,
+) {
+    crate::circuit_breaker::register_parent_check_callback(callback);
+}
+
+/// Read circuit breaker stats into a caller-provided buffer of 4 × i64 = 32 bytes.
+/// Layout: [limit_bytes, used_bytes, tripped_count, overhead_millionths]
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_get_breaker_stats(out_ptr: *mut i64) -> i64 {
+    let breaker = crate::circuit_breaker::get()
+        .ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    let stats = breaker.stats();
+    *out_ptr = stats.limit_bytes as i64;
+    *out_ptr.add(1) = stats.used_bytes as i64;
+    *out_ptr.add(2) = stats.tripped_count as i64;
+    *out_ptr.add(3) = stats.overhead_millionths as i64;
+    Ok(0)
+}
+
+/// Dynamically update the circuit breaker limit.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_set_breaker_limit(limit_bytes: i64) -> i64 {
+    let breaker = crate::circuit_breaker::get()
+        .ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    breaker.set_limit(limit_bytes as usize);
+    Ok(0)
+}
+
+/// Dynamically update the circuit breaker overhead multiplier.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_set_breaker_overhead(overhead_millionths: i64) -> i64 {
+    let breaker = crate::circuit_breaker::get()
+        .ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    breaker.set_overhead(overhead_millionths as u64);
+    Ok(0)
+}
