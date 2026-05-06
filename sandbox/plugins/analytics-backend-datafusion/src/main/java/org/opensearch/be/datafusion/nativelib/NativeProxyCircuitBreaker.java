@@ -8,6 +8,8 @@
 
 package org.opensearch.be.datafusion.nativelib;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
@@ -30,6 +32,7 @@ import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
  */
 public class NativeProxyCircuitBreaker implements CircuitBreaker {
 
+    private static final Logger logger = LogManager.getLogger(NativeProxyCircuitBreaker.class);
     private static final String NAME = "native_request";
 
     /** Reference to the breaker service for the upcall. Set once during init. */
@@ -65,6 +68,7 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
             svc.checkParentLimit(bytesToReserve, "native_request");
             return 0; // OK
         } catch (CircuitBreakingException e) {
+            logger.warn("Java parent breaker tripped on Rust upcall: {}", e.getMessage());
             return 1; // tripped
         }
     }

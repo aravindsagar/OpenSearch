@@ -15,6 +15,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use log::{debug, warn};
 use once_cell::sync::OnceCell;
 
 /// Global singleton breaker instance.
@@ -22,6 +23,11 @@ static BREAKER: OnceCell<NativeRequestBreaker> = OnceCell::new();
 
 /// Initialize the global breaker. Returns `Err` if already initialized.
 pub fn init(limit_bytes: usize, overhead_millionths: u64) -> Result<(), &'static str> {
+    debug!(
+        "Initializing NativeRequestBreaker: limit={}B, overhead={:.6}",
+        limit_bytes,
+        overhead_millionths as f64 / 1_000_000.0
+    );
     BREAKER
         .set(NativeRequestBreaker {
             limit_bytes: AtomicUsize::new(limit_bytes),
@@ -76,6 +82,10 @@ impl NativeRequestBreaker {
             Ok(_) => Ok(()),
             Err(current) => {
                 self.tripped_count.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "NativeRequestBreaker tripped: wanted {}B, current {}B, limit {}B (with overhead {:.2})",
+                    bytes, current, limit, overhead
+                );
                 Err(CircuitBreakError {
                     bytes_wanted: bytes,
                     bytes_limit: limit,
@@ -217,6 +227,10 @@ impl NativeNodeBreaker {
         if result != 0 {
             let limit = self.node_limit.load(Ordering::Relaxed);
             self.tripped_count.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "NativeNodeBreaker tripped (Java parent check failed): wanted {}B, node limit {}B",
+                bytes, limit
+            );
             return Err(CircuitBreakError {
                 bytes_wanted: bytes,
                 bytes_limit: limit,
