@@ -111,8 +111,9 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
 
     @Override
     public long getUsed() {
-        maybeRefreshCache();
-        return cachedTotalUsed;
+        // Real-time FFM downcall (no caching for this benchmark config)
+        long[] stats = NativeBridge.getBreakerStats();
+        return stats[3]; // total_used_bytes
     }
 
     @Override
@@ -127,19 +128,8 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
 
     @Override
     public long getTrippedCount() {
-        maybeRefreshCache();
-        return cachedTripped;
-    }
-
-    private void maybeRefreshCache() {
-        long now = System.nanoTime();
-        if (now - lastRefreshNanos > CACHE_TTL_NS) {
-            long[] stats = NativeBridge.getBreakerStats();
-            cachedTotalUsed = stats[3]; // total_used_bytes
-            cachedTripped = stats[4] + stats[5] + stats[6]; // child + node + parent tripped
-            lastRefreshNanos = now;
-            logger.debug("CB proxy cache refreshed: totalUsed={}B, tripped={}", cachedTotalUsed, cachedTripped);
-        }
+        long[] stats = NativeBridge.getBreakerStats();
+        return stats[4] + stats[5] + stats[6];
     }
 
     @Override

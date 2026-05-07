@@ -101,41 +101,10 @@ impl NativeCircuitBreaker {
             return Err(e);
         }
 
-        // 3. Java parent upcall — time-gated (at most once per second)
-        let now = self.now_ns();
-        let last_parent = self.last_parent_check_ns.load(Ordering::Relaxed);
-        if now.saturating_sub(last_parent) > CACHE_TTL_NS {
-            if self.last_parent_check_ns.compare_exchange(last_parent, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                debug!("CB: running fresh Java parent check ({}ms since last)", (now - last_parent) / 1_000_000);
-                let ok = self.check_parent(bytes).is_ok();
-                self.last_parent_check_ok.store(ok, Ordering::Release);
-                if !ok {
-                    self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                    return Err(CircuitBreakError {
-                        bytes_wanted: bytes,
-                        bytes_limit: self.node_limit.load(Ordering::Relaxed),
-                        current_used: self.cached_total_bytes.load(Ordering::Relaxed),
-                    });
-                }
-            } else {
-                // Another thread claimed the refresh — check last known result
-                if !self.last_parent_check_ok.load(Ordering::Acquire) {
-                    self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                    return Err(CircuitBreakError {
-                        bytes_wanted: bytes,
-                        bytes_limit: self.node_limit.load(Ordering::Relaxed),
-                        current_used: self.cached_total_bytes.load(Ordering::Relaxed),
-                    });
-                }
-            }
-        } else if !self.last_parent_check_ok.load(Ordering::Acquire) {
-            // Last parent check tripped — keep rejecting until next fresh check
+        // 3. Java parent upcall — every allocation (no caching for this benchmark config)
+        if let Err(e) = self.check_parent(bytes) {
             self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(CircuitBreakError {
-                bytes_wanted: bytes,
-                bytes_limit: self.node_limit.load(Ordering::Relaxed),
-                current_used: self.cached_total_bytes.load(Ordering::Relaxed),
-            });
+            return Err(e);
         }
 
         Ok(())
