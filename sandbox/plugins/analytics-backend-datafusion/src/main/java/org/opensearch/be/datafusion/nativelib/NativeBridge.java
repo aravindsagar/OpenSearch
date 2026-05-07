@@ -853,9 +853,9 @@ public final class NativeBridge {
     // ---- Circuit breaker ----
 
     /** Initialize the native circuit breaker. */
-    public static void initCircuitBreaker(long limitBytes, long overheadMillionths, long nodeLimitBytes) {
+    public static void initCircuitBreaker(long childLimitBytes, long nodeLimitBytes, long overheadMillionths) {
         try (var call = new NativeCall()) {
-            call.invoke(INIT_CIRCUIT_BREAKER, limitBytes, overheadMillionths, nodeLimitBytes);
+            call.invoke(INIT_CIRCUIT_BREAKER, childLimitBytes, nodeLimitBytes, overheadMillionths);
         }
     }
 
@@ -880,10 +880,15 @@ public final class NativeBridge {
     }
 
     /** Read breaker stats: [limitBytes, usedBytes, trippedCount, overheadMillionths]. */
+    /**
+     * Read breaker stats: [childLimit, nodeLimit, requestUsed, totalUsed, childTripped, nodeTripped, parentTripped, overhead].
+     */
     public static long[] getBreakerStats() {
-        try (var call = new NativeCall()) {
-            var seg = call.arena().allocate(ValueLayout.JAVA_LONG, 4);
-            call.invoke(GET_BREAKER_STATS, seg);
+        try (var arena = java.lang.foreign.Arena.ofConfined()) {
+            var seg = arena.allocate(ValueLayout.JAVA_LONG, 8);
+            try (var call = new NativeCall()) {
+                call.invoke(GET_BREAKER_STATS, seg);
+            }
             return seg.toArray(ValueLayout.JAVA_LONG);
         }
     }

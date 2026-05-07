@@ -88,8 +88,10 @@ public class DataFusionService extends AbstractLifecycleComponent {
         logger.debug("DataFusion service started — memory pool {}B, spill limit {}B", memoryPoolLimit, spillMemoryLimit);
 
         // Initialize the native circuit breaker.
-        long nodeLimitBytes = memoryPoolLimit; // TODO: derive from system memory - JVM heap - safety margin
-        NativeBridge.initCircuitBreaker(memoryPoolLimit, 1_000_000L, nodeLimitBytes);
+        // child_limit: query-path memory limit (same as GreedyMemoryPool)
+        // node_limit: total native memory budget (TODO: derive from system memory - JVM heap - safety margin)
+        long nodeLimitBytes = Runtime.getRuntime().maxMemory() * 2; // rough: 2× JVM heap as native budget
+        NativeBridge.initCircuitBreaker(memoryPoolLimit, nodeLimitBytes, 1_000_000L);
 
         // Register the parent check upcall so Rust can call Java's checkParentLimit in real-time.
         try {

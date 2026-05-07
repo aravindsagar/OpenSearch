@@ -88,8 +88,8 @@ impl MemoryPool for QueryMemoryPool {
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.track_shrink(shrink);
         self.inner.shrink(reservation, shrink);
-        if let Some(breaker) = circuit_breaker::get() {
-            breaker.release(shrink);
+        if let Some(cb) = circuit_breaker::get() {
+            cb.release(shrink);
         }
     }
 
@@ -98,32 +98,20 @@ impl MemoryPool for QueryMemoryPool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> Result<(), DataFusionError> {
-        // 1. Child circuit breaker check (OpenSearch semantics)
-        if let Some(breaker) = circuit_breaker::get() {
-            breaker.try_reserve(additional).map_err(|e| {
-                DataFusionError::ResourcesExhausted(e.to_encoded_string())
-            })?;
+        // Circuit breaker: child + node + Java parent checks
+        if let Some(cb) = circuit_breaker::get() {
+            cb.check_and_reserve(additional)
+                .map_err(|e| DataFusionError::ResourcesExhausted(e.to_encoded_string()))?;
         }
-        // 2. Node-level check (total process memory via jemalloc + Java usage)
-        if let Some(node_breaker) = circuit_breaker::get_node_breaker() {
-            if let Err(e) = node_breaker.check_node_limit(additional) {
-                // Roll back child breaker
-                if let Some(breaker) = circuit_breaker::get() {
-                    breaker.release(additional);
-                }
-                return Err(DataFusionError::ResourcesExhausted(e.to_encoded_string()));
-            }
-        }
-        // 3. Global pool hard ceiling (safety net)
+        // Global pool hard ceiling (safety net)
         match self.inner.try_grow(reservation, additional) {
             Ok(()) => {
                 self.track_grow(additional);
                 Ok(())
             }
             Err(e) => {
-                // Roll back child breaker reservation on pool failure
-                if let Some(breaker) = circuit_breaker::get() {
-                    breaker.release(additional);
+                if let Some(cb) = circuit_breaker::get() {
+                    cb.release(additional);
                 }
                 Err(e)
             }

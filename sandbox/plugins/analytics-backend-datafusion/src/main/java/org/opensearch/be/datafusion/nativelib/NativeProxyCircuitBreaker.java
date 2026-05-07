@@ -53,23 +53,36 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
     }
 
     /**
-     * Static callback invoked by Rust via FFM upcall. Calls Java's checkParentLimit
-     * for a real-time node-level check (JVM heap + all children including native proxy).
+     * Static callback invoked by Rust via FFM upcall. Performs a combined node-level check
+     * (JVM heap + Rust total memory) and also calls the existing Java parent breaker.
      *
      * @param bytesToReserve bytes the Rust side wants to allocate
-     * @return 0 if OK, 1 if the parent breaker tripped
+     * @return 0 if OK, 1 if tripped
      */
     public static long checkParentFromRust(long bytesToReserve) {
         HierarchyCircuitBreakerService svc = breakerService;
         if (svc == null) {
             return 0; // not initialized yet — allow
         }
+
+        // Combined node check: JVM heap + Rust total > node limit
+        long jvmHeap = java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+        long[] stats = NativeBridge.getBreakerStats();
+        long rustTotal = stats[3]; // total_used_bytes (jemalloc)
+        long nodeLimit = stats[1]; // node_limit from Rust
+        if (jvmHeap + rustTotal + bytesToReserve > nodeLimit) {
+            logger.warn("Combined node check tripped: JVM={}B + Rust={}B + new={}B > limit={}B",
+                jvmHeap, rustTotal, bytesToReserve, nodeLimit);
+            return 1;
+        }
+
+        // Existing Java parent check (JVM-only, includes G1GC recovery strategy)
         try {
             svc.checkParentLimit(bytesToReserve, "native_request");
-            return 0; // OK
+            return 0;
         } catch (CircuitBreakingException e) {
             logger.warn("Java parent breaker tripped on Rust upcall: {}", e.getMessage());
-            return 1; // tripped
+            return 1;
         }
     }
 
@@ -86,10 +99,15 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
     }
 
     @Override
+    public void circuitBreak(String fieldName, long bytesNeeded) {
+        // No-op: tripping happens on the Rust side
+    }
+
+    @Override
     public long getUsed() {
-        // FFM downcall for fresh Rust-side stats on every invocation (naive — no caching).
+        // Return total Rust-side memory (from jemalloc) for parent breaker visibility
         long[] stats = NativeBridge.getBreakerStats();
-        return stats[1]; // used_bytes from Rust
+        return stats[3]; // total_used_bytes
     }
 
     @Override
@@ -105,7 +123,7 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
     @Override
     public long getTrippedCount() {
         long[] stats = NativeBridge.getBreakerStats();
-        return stats[2];
+        return stats[4] + stats[5] + stats[6]; // child + node + parent tripped
     }
 
     @Override
