@@ -92,10 +92,7 @@ impl NativeCircuitBreaker {
     /// - Node check: ALWAYS (compares against cached jemalloc value, refreshed every 1s)
     /// - Java parent upcall: at most once per second
     pub fn check_and_reserve(&self, bytes: usize) -> Result<(), CircuitBreakError> {
-        // 1. Child check — always (real-time per-query protection)
-        self.check_child(bytes)?;
-
-        // BENCHMARK: Request-level CB only — no node check, no Java parent
+        // BENCHMARK: CB disabled for baseline
         Ok(())
     }
 
