@@ -18,11 +18,13 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use log::{debug, warn};
 use once_cell::sync::OnceCell;
 
 static BREAKER: OnceCell<NativeCircuitBreaker> = OnceCell::new();
+static START_TIME: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
 
 /// Upcall to Java's parent check. Signature: (bytes: i64) -> i64 (0=OK, non-zero=tripped)
 pub type CheckParentFn = unsafe extern "C" fn(i64) -> i64;
@@ -43,6 +45,8 @@ pub fn init(child_limit: usize, node_limit: usize, overhead_millionths: u64) -> 
             child_tripped: AtomicU64::new(0),
             node_tripped: AtomicU64::new(0),
             parent_tripped: AtomicU64::new(0),
+            last_node_check_ns: AtomicU64::new(0),
+            last_node_check_ok: std::sync::atomic::AtomicBool::new(true),
         })
         .map_err(|_| "circuit breaker already initialized")
 }
@@ -69,28 +73,62 @@ pub struct NativeCircuitBreaker {
     child_tripped: AtomicU64,
     node_tripped: AtomicU64,
     parent_tripped: AtomicU64,
+    // Time-based cache: node + parent checks run at most once per second
+    last_node_check_ns: AtomicU64,
+    last_node_check_ok: std::sync::atomic::AtomicBool,
 }
+
+/// Cache TTL for node + parent checks (1 second in nanoseconds).
+const NODE_CHECK_CACHE_NS: u64 = 1_000_000_000;
 
 impl NativeCircuitBreaker {
     /// Main entry point: check all levels and reserve bytes.
-    /// Called from `QueryMemoryPool.try_grow()`.
+    /// - Child check: ALWAYS (cheap atomic CAS)
+    /// - Node + parent check: at most once per second (time-based cache)
     pub fn check_and_reserve(&self, bytes: usize) -> Result<(), CircuitBreakError> {
-        // 1. Child check: request memory limit
+        // 1. Child check — always (real-time per-query protection)
         self.check_child(bytes)?;
 
-        // 2. Node check: total Rust process memory (jemalloc)
-        if let Err(e) = self.check_node(bytes) {
+        // 2. Node + parent check — time-gated (at most once per second)
+        let now = self.now_ns();
+        let last = self.last_node_check_ns.load(Ordering::Relaxed);
+        if now.saturating_sub(last) > NODE_CHECK_CACHE_NS {
+            // Time to run a fresh check. CAS to claim it (avoid thundering herd).
+            if self.last_node_check_ns.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                debug!("CB: running fresh node+parent check ({}ms since last)", (now - last) / 1_000_000);
+                let ok = self.run_node_and_parent_check(bytes);
+                self.last_node_check_ok.store(ok, Ordering::Release);
+                if !ok {
+                    self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                    return Err(CircuitBreakError {
+                        bytes_wanted: bytes,
+                        bytes_limit: self.node_limit.load(Ordering::Relaxed),
+                        current_used: self.total_used_bytes(),
+                    });
+                }
+            }
+        } else if !self.last_node_check_ok.load(Ordering::Acquire) {
+            // Last check tripped — keep rejecting until next fresh check clears it
             self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(e);
-        }
-
-        // 3. Java parent check: combined JVM + native
-        if let Err(e) = self.check_parent(bytes) {
-            self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(e);
+            return Err(CircuitBreakError {
+                bytes_wanted: bytes,
+                bytes_limit: self.node_limit.load(Ordering::Relaxed),
+                current_used: self.total_used_bytes(),
+            });
         }
 
         Ok(())
+    }
+
+    /// Runs the expensive node + parent checks. Returns true if OK, false if tripped.
+    fn run_node_and_parent_check(&self, bytes: usize) -> bool {
+        if let Err(_) = self.check_node(bytes) {
+            return false;
+        }
+        if let Err(_) = self.check_parent(bytes) {
+            return false;
+        }
+        true
     }
 
     /// Release bytes. Called from `QueryMemoryPool.shrink()`.
@@ -196,6 +234,10 @@ impl NativeCircuitBreaker {
     fn overhead(&self) -> f64 {
         self.overhead_millionths.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
+
+    fn now_ns(&self) -> u64 {
+        START_TIME.elapsed().as_nanos() as u64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +325,8 @@ mod tests {
             child_tripped: AtomicU64::new(0),
             node_tripped: AtomicU64::new(0),
             parent_tripped: AtomicU64::new(0),
+            last_node_check_ns: AtomicU64::new(0),
+            last_node_check_ok: std::sync::atomic::AtomicBool::new(true),
         }
     }
 

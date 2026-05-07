@@ -34,12 +34,18 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
 
     private static final Logger logger = LogManager.getLogger(NativeProxyCircuitBreaker.class);
     private static final String NAME = "native_request";
+    private static final long CACHE_TTL_NS = 1_000_000_000L; // 1 second
 
     /** Reference to the breaker service for the upcall. Set once during init. */
     private static volatile HierarchyCircuitBreakerService breakerService;
 
     private volatile long limitBytes;
     private volatile double overhead;
+
+    // Cached stats for getUsed() — refreshed at most once per second
+    private volatile long cachedTotalUsed = 0;
+    private volatile long cachedTripped = 0;
+    private volatile long lastRefreshNanos = 0;
 
     /**
      * @param limitBytes initial breaker limit
@@ -105,9 +111,8 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
 
     @Override
     public long getUsed() {
-        // Return total Rust-side memory (from jemalloc) for parent breaker visibility
-        long[] stats = NativeBridge.getBreakerStats();
-        return stats[3]; // total_used_bytes
+        maybeRefreshCache();
+        return cachedTotalUsed;
     }
 
     @Override
@@ -122,8 +127,19 @@ public class NativeProxyCircuitBreaker implements CircuitBreaker {
 
     @Override
     public long getTrippedCount() {
-        long[] stats = NativeBridge.getBreakerStats();
-        return stats[4] + stats[5] + stats[6]; // child + node + parent tripped
+        maybeRefreshCache();
+        return cachedTripped;
+    }
+
+    private void maybeRefreshCache() {
+        long now = System.nanoTime();
+        if (now - lastRefreshNanos > CACHE_TTL_NS) {
+            long[] stats = NativeBridge.getBreakerStats();
+            cachedTotalUsed = stats[3]; // total_used_bytes
+            cachedTripped = stats[4] + stats[5] + stats[6]; // child + node + parent tripped
+            lastRefreshNanos = now;
+            logger.debug("CB proxy cache refreshed: totalUsed={}B, tripped={}", cachedTotalUsed, cachedTripped);
+        }
     }
 
     @Override
