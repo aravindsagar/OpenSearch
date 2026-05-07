@@ -45,8 +45,10 @@ pub fn init(child_limit: usize, node_limit: usize, overhead_millionths: u64) -> 
             child_tripped: AtomicU64::new(0),
             node_tripped: AtomicU64::new(0),
             parent_tripped: AtomicU64::new(0),
-            last_node_check_ns: AtomicU64::new(0),
-            last_node_check_ok: std::sync::atomic::AtomicBool::new(true),
+            cached_total_bytes: AtomicUsize::new(0),
+            last_total_refresh_ns: AtomicU64::new(0),
+            last_parent_check_ns: AtomicU64::new(0),
+            last_parent_check_ok: std::sync::atomic::AtomicBool::new(true),
         })
         .map_err(|_| "circuit breaker already initialized")
 }
@@ -73,62 +75,99 @@ pub struct NativeCircuitBreaker {
     child_tripped: AtomicU64,
     node_tripped: AtomicU64,
     parent_tripped: AtomicU64,
-    // Time-based cache: node + parent checks run at most once per second
-    last_node_check_ns: AtomicU64,
-    last_node_check_ok: std::sync::atomic::AtomicBool,
+    // Cached jemalloc total — refreshed at most once per second
+    cached_total_bytes: AtomicUsize,
+    last_total_refresh_ns: AtomicU64,
+    // Java parent check — time-gated (at most once per second)
+    last_parent_check_ns: AtomicU64,
+    last_parent_check_ok: std::sync::atomic::AtomicBool,
 }
 
-/// Cache TTL for node + parent checks (1 second in nanoseconds).
-const NODE_CHECK_CACHE_NS: u64 = 1_000_000_000;
+/// Cache TTL for expensive operations (1 second in nanoseconds).
+const CACHE_TTL_NS: u64 = 1_000_000_000;
 
 impl NativeCircuitBreaker {
     /// Main entry point: check all levels and reserve bytes.
     /// - Child check: ALWAYS (cheap atomic CAS)
-    /// - Node + parent check: at most once per second (time-based cache)
+    /// - Node check: ALWAYS (compares against cached jemalloc value, refreshed every 1s)
+    /// - Java parent upcall: at most once per second
     pub fn check_and_reserve(&self, bytes: usize) -> Result<(), CircuitBreakError> {
         // 1. Child check — always (real-time per-query protection)
         self.check_child(bytes)?;
 
-        // 2. Node + parent check — time-gated (at most once per second)
+        // 2. Node check — always runs, but uses cached jemalloc value (refreshed every 1s)
+        if let Err(e) = self.check_node_cached(bytes) {
+            self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(e);
+        }
+
+        // 3. Java parent upcall — time-gated (at most once per second)
         let now = self.now_ns();
-        let last = self.last_node_check_ns.load(Ordering::Relaxed);
-        if now.saturating_sub(last) > NODE_CHECK_CACHE_NS {
-            // Time to run a fresh check. CAS to claim it (avoid thundering herd).
-            if self.last_node_check_ns.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                debug!("CB: running fresh node+parent check ({}ms since last)", (now - last) / 1_000_000);
-                let ok = self.run_node_and_parent_check(bytes);
-                self.last_node_check_ok.store(ok, Ordering::Release);
+        let last_parent = self.last_parent_check_ns.load(Ordering::Relaxed);
+        if now.saturating_sub(last_parent) > CACHE_TTL_NS {
+            if self.last_parent_check_ns.compare_exchange(last_parent, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                debug!("CB: running fresh Java parent check ({}ms since last)", (now - last_parent) / 1_000_000);
+                let ok = self.check_parent(bytes).is_ok();
+                self.last_parent_check_ok.store(ok, Ordering::Release);
                 if !ok {
                     self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
                     return Err(CircuitBreakError {
                         bytes_wanted: bytes,
                         bytes_limit: self.node_limit.load(Ordering::Relaxed),
-                        current_used: self.total_used_bytes(),
+                        current_used: self.cached_total_bytes.load(Ordering::Relaxed),
+                    });
+                }
+            } else {
+                // Another thread claimed the refresh — check last known result
+                if !self.last_parent_check_ok.load(Ordering::Acquire) {
+                    self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                    return Err(CircuitBreakError {
+                        bytes_wanted: bytes,
+                        bytes_limit: self.node_limit.load(Ordering::Relaxed),
+                        current_used: self.cached_total_bytes.load(Ordering::Relaxed),
                     });
                 }
             }
-        } else if !self.last_node_check_ok.load(Ordering::Acquire) {
-            // Last check tripped — keep rejecting until next fresh check clears it
+        } else if !self.last_parent_check_ok.load(Ordering::Acquire) {
+            // Last parent check tripped — keep rejecting until next fresh check
             self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
             return Err(CircuitBreakError {
                 bytes_wanted: bytes,
                 bytes_limit: self.node_limit.load(Ordering::Relaxed),
-                current_used: self.total_used_bytes(),
+                current_used: self.cached_total_bytes.load(Ordering::Relaxed),
             });
         }
 
         Ok(())
     }
 
-    /// Runs the expensive node + parent checks. Returns true if OK, false if tripped.
-    fn run_node_and_parent_check(&self, bytes: usize) -> bool {
-        if let Err(_) = self.check_node(bytes) {
-            return false;
+    /// Refresh the cached jemalloc total if stale, then check against node_limit.
+    fn check_node_cached(&self, bytes: usize) -> Result<(), CircuitBreakError> {
+        let limit = self.node_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            return Ok(());
         }
-        if let Err(_) = self.check_parent(bytes) {
-            return false;
+
+        // Refresh jemalloc cache if >1s old
+        let now = self.now_ns();
+        let last_refresh = self.last_total_refresh_ns.load(Ordering::Relaxed);
+        if now.saturating_sub(last_refresh) > CACHE_TTL_NS {
+            if self.last_total_refresh_ns.compare_exchange(last_refresh, now, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                let fresh = native_bridge_common::allocator::allocated_bytes();
+                let val = if fresh > 0 { fresh as usize } else { self.request_used_bytes.load(Ordering::Relaxed) };
+                self.cached_total_bytes.store(val, Ordering::Release);
+                debug!("CB: jemalloc cache refreshed: {}B", val);
+            }
         }
-        true
+
+        // Always check against cached value
+        let total = self.cached_total_bytes.load(Ordering::Relaxed);
+        if total + bytes > limit {
+            self.node_tripped.fetch_add(1, Ordering::Relaxed);
+            warn!("CB node tripped: total {}B + wanted {}B > limit {}B", total, bytes, limit);
+            return Err(CircuitBreakError { bytes_wanted: bytes, bytes_limit: limit, current_used: total });
+        }
+        Ok(())
     }
 
     /// Release bytes. Called from `QueryMemoryPool.shrink()`.
@@ -161,21 +200,6 @@ impl NativeCircuitBreaker {
         }
     }
 
-    /// Node-level check: jemalloc total allocated + bytes > node_limit?
-    fn check_node(&self, bytes: usize) -> Result<(), CircuitBreakError> {
-        let limit = self.node_limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            return Ok(());
-        }
-        let total = self.total_used_bytes();
-        if total + bytes > limit {
-            self.node_tripped.fetch_add(1, Ordering::Relaxed);
-            warn!("CB node tripped: total {}B + wanted {}B > limit {}B", total, bytes, limit);
-            return Err(CircuitBreakError { bytes_wanted: bytes, bytes_limit: limit, current_used: total });
-        }
-        Ok(())
-    }
-
     /// Java parent check via upcall.
     fn check_parent(&self, bytes: usize) -> Result<(), CircuitBreakError> {
         let fn_ptr = CHECK_PARENT_CALLBACK.load(Ordering::Acquire);
@@ -196,10 +220,9 @@ impl NativeCircuitBreaker {
         Ok(())
     }
 
-    /// Total Rust-side memory from jemalloc. Falls back to request_used_bytes if unavailable.
+    /// Total Rust-side memory — returns cached jemalloc value.
     pub fn total_used_bytes(&self) -> usize {
-        let jemalloc = native_bridge_common::allocator::allocated_bytes();
-        if jemalloc > 0 { jemalloc as usize } else { self.request_used_bytes.load(Ordering::Relaxed) }
+        self.cached_total_bytes.load(Ordering::Relaxed)
     }
 
     // --- Dynamic updates ---
@@ -325,8 +348,10 @@ mod tests {
             child_tripped: AtomicU64::new(0),
             node_tripped: AtomicU64::new(0),
             parent_tripped: AtomicU64::new(0),
-            last_node_check_ns: AtomicU64::new(0),
-            last_node_check_ok: std::sync::atomic::AtomicBool::new(true),
+            cached_total_bytes: AtomicUsize::new(0),
+            last_total_refresh_ns: AtomicU64::new(0),
+            last_parent_check_ns: AtomicU64::new(0),
+            last_parent_check_ok: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
