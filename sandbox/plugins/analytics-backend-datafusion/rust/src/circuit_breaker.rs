@@ -95,18 +95,7 @@ impl NativeCircuitBreaker {
         // 1. Child check — always (real-time per-query protection)
         self.check_child(bytes)?;
 
-        // 2. Node check — always runs, but uses cached jemalloc value (refreshed every 1s)
-        if let Err(e) = self.check_node_cached(bytes) {
-            self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(e);
-        }
-
-        // 3. Java parent upcall — every allocation (no caching for this benchmark config)
-        if let Err(e) = self.check_parent(bytes) {
-            self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(e);
-        }
-
+        // BENCHMARK: Request-level CB only — no node check, no Java parent
         Ok(())
     }
 
