@@ -134,11 +134,15 @@ impl NativeCircuitBreaker {
         }
     }
 
-    /// Level 2: cached_jemalloc_total + bytes > node_limit?
+    /// Level 2: jemalloc total allocated (UNCACHED — calls epoch.advance every time) + bytes > node_limit?
     fn check_node(&self, bytes: usize) -> Result<(), CircuitBreakError> {
         let limit = self.node_limit.load(Ordering::Relaxed);
         if limit == 0 { return Ok(()); }
-        let total = self.cached_total_bytes.load(Ordering::Relaxed);
+        // Direct jemalloc call on every allocation (for benchmarking uncached overhead)
+        let total = {
+            let alloc = native_bridge_common::allocator::allocated_bytes();
+            if alloc > 0 { alloc as usize } else { self.cached_total_bytes.load(Ordering::Relaxed) }
+        };
         if total + bytes > limit {
             self.node_tripped.fetch_add(1, Ordering::Relaxed);
             warn!("CB node tripped: total {}B + wanted {}B > limit {}B", total, bytes, limit);
