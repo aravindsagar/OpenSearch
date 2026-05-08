@@ -11,10 +11,12 @@ package org.opensearch.be.datafusion;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.be.datafusion.cache.CacheSettings;
+import org.opensearch.be.datafusion.nativelib.NativeBridge;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
@@ -22,6 +24,8 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.indices.breaker.BreakerSettings;
+import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
 import org.opensearch.repositories.RepositoriesService;
@@ -46,7 +50,7 @@ import io.substrait.extension.SimpleExtension;
  * Analytics query capabilities are declared in {@link DataFusionAnalyticsBackendPlugin},
  * which is SPI-discovered and receives this plugin instance via its constructor.
  */
-public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<DatafusionReader> {
+public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<DatafusionReader>, CircuitBreakerPlugin {
 
     private static final Logger logger = LogManager.getLogger(DataFusionPlugin.class);
 
@@ -97,6 +101,7 @@ public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<Data
     private static final String SUPPORTED_FORMAT = "parquet";
 
     private volatile DataFusionService dataFusionService;
+    private volatile CircuitBreaker nativeBreaker;
     private volatile DataFormatRegistry dataFormatRegistry;
     private volatile SimpleExtension.ExtensionCollection substraitExtensions;
     private volatile ClusterService clusterService;
@@ -239,6 +244,53 @@ public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<Data
     @Override
     public List<String> getSupportedFormats() {
         return List.of(SUPPORTED_FORMAT);
+    }
+
+    @Override
+    public BreakerSettings getCircuitBreaker(Settings settings) {
+        long limit = DATAFUSION_MEMORY_POOL_LIMIT.get(settings);
+        return new BreakerSettings("native_request", limit, 1.0, CircuitBreaker.Type.MEMORY, CircuitBreaker.Durability.TRANSIENT);
+    }
+
+    @Override
+    public void setCircuitBreaker(CircuitBreaker circuitBreaker) {
+        this.nativeBreaker = circuitBreaker;
+        staticBreaker = circuitBreaker;
+        // Register the stats-push callback so Rust updates this breaker's counter in real-time
+        registerStatsCallback(circuitBreaker);
+    }
+
+    private static void registerStatsCallback(CircuitBreaker breaker) {
+        try {
+            var lookup = java.lang.invoke.MethodHandles.lookup();
+            // Static method that Rust calls: (requestUsed, totalUsed, childTripped, nodeTripped) -> void
+            var callback = lookup.findStatic(
+                DataFusionPlugin.class, "onStatsUpdate",
+                java.lang.invoke.MethodType.methodType(void.class, long.class, long.class, long.class, long.class)
+            );
+            NativeBridge.registerStatsCallback(callback);
+        } catch (Throwable t) {
+            throw new RuntimeException("Failed to register stats callback", t);
+        }
+    }
+
+    /** Upcall target: Rust pushes stats here after every check_and_reserve/release. */
+    private static volatile CircuitBreaker staticBreaker;
+    private static volatile long lastSyncedUsed = 0;
+
+    public static void onStatsUpdate(long requestUsed, long totalUsed, long childTripped, long nodeTripped) {
+        CircuitBreaker b = staticBreaker;
+        if (b == null) return;
+        long delta = requestUsed - lastSyncedUsed;
+        if (delta != 0) {
+            b.addWithoutBreaking(delta);
+            lastSyncedUsed = requestUsed;
+        }
+    }
+
+    /** Returns the Java-side child breaker for native_request (used by DataFusionService for stats sync). */
+    CircuitBreaker getNativeBreaker() {
+        return nativeBreaker;
     }
 
     @Override

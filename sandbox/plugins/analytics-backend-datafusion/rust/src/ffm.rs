@@ -651,3 +651,50 @@ pub unsafe extern "C" fn df_execute_with_context(
             .map_err(|e| e.to_string())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Circuit breaker FFM exports
+// ---------------------------------------------------------------------------
+
+/// Initialize the native circuit breaker and spawn the jemalloc refresh timer.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_init_circuit_breaker(
+    request_limit: i64,
+    node_limit: i64,
+    overhead_millionths: i64,
+) -> i64 {
+    let mgr = get_rt_manager()?;
+    crate::circuit_breaker::init(
+        request_limit as usize,
+        node_limit as usize,
+        overhead_millionths as u64,
+        mgr.io_runtime.handle(),
+    ).map_err(|e| e.to_string())?;
+    Ok(0i64)
+}
+
+/// Register the Java stats-push callback.
+/// Signature: (request_used: i64, total_used: i64, child_tripped: i64, node_tripped: i64)
+#[no_mangle]
+pub unsafe extern "C" fn df_register_stats_callback(callback: crate::circuit_breaker::StatsPushFn) {
+    crate::circuit_breaker::register_stats_callback(callback);
+}
+
+/// Dynamically update the request-level breaker limit.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_set_breaker_limit(limit: i64) -> i64 {
+    let cb = crate::circuit_breaker::get().ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    cb.set_request_limit(limit as usize);
+    Ok(0)
+}
+
+/// Dynamically update the node-level breaker limit.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_set_breaker_node_limit(limit: i64) -> i64 {
+    let cb = crate::circuit_breaker::get().ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    cb.set_node_limit(limit as usize);
+    Ok(0)
+}
