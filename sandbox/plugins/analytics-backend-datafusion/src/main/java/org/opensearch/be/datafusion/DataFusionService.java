@@ -36,6 +36,9 @@ public class DataFusionService extends AbstractLifecycleComponent {
 
     private static final Logger logger = LogManager.getLogger(DataFusionService.class);
 
+    /** Node-level breaker limit is this multiplier × request limit, providing headroom for untracked allocations. */
+    private static final double NODE_LIMIT_MULTIPLIER = 1.5;
+
     private final long memoryPoolLimit;
     private final long spillMemoryLimit;
     private final String spillDirectory;
@@ -87,6 +90,11 @@ public class DataFusionService extends AbstractLifecycleComponent {
         }
 
         logger.debug("DataFusion service started — memory pool {}B, spill limit {}B", memoryPoolLimit, spillMemoryLimit);
+
+        // Initialize native circuit breaker (spawns jemalloc refresh timer on IO runtime)
+        long nodeLimit = (long) (memoryPoolLimit * NODE_LIMIT_MULTIPLIER); // 50% headroom for untracked allocations
+        NativeBridge.initCircuitBreaker(memoryPoolLimit, nodeLimit, 1_000_000L);
+        logger.debug("Native circuit breaker initialized — request_limit={}B, node_limit={}B", memoryPoolLimit, nodeLimit);
     }
 
     @Override
@@ -149,6 +157,8 @@ public class DataFusionService extends AbstractLifecycleComponent {
      */
     public void setMemoryPoolLimit(long newLimitBytes) {
         NativeBridge.setMemoryPoolLimit(getNativeRuntime().get(), newLimitBytes);
+        NativeBridge.setBreakerLimit(newLimitBytes);
+        NativeBridge.setBreakerNodeLimit((long) (newLimitBytes * NODE_LIMIT_MULTIPLIER));
     }
 
     /**

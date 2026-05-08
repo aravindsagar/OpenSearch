@@ -41,6 +41,7 @@ import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
+import org.opensearch.core.indices.breaker.CircuitBreakerStats;
 import org.opensearch.monitor.jvm.JvmInfo;
 import org.opensearch.search.aggregations.MultiBucketConsumerService;
 import org.opensearch.test.OpenSearchTestCase;
@@ -850,5 +851,41 @@ public class HierarchyCircuitBreakerServiceTests extends OpenSearchTestCase {
 
     private static long mb(long size) {
         return new ByteSizeValue(size, ByteSizeUnit.MB).getBytes();
+    }
+
+    public void testStatsSupplierOverridesDefaultStats() {
+        CircuitBreakerStats customStats = new CircuitBreakerStats("custom_breaker", 1024, 512, 1.0, 3);
+        BreakerSettings customBreaker = new BreakerSettings(
+            "custom_breaker", 1024, 1.0,
+            CircuitBreaker.Type.MEMORY, CircuitBreaker.Durability.TRANSIENT,
+            () -> customStats
+        );
+        final CircuitBreakerService service = new HierarchyCircuitBreakerService(
+            Settings.EMPTY,
+            Collections.singletonList(customBreaker),
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+        );
+        CircuitBreakerStats stats = service.stats("custom_breaker");
+        assertEquals("custom_breaker", stats.getName());
+        assertEquals(1024, stats.getLimit());
+        assertEquals(512, stats.getEstimated());
+        assertEquals(3, stats.getTrippedCount());
+    }
+
+    public void testStatsSupplierNullUsesDefaultPath() {
+        BreakerSettings customBreaker = new BreakerSettings(
+            "custom_breaker", 2048, 2.0,
+            CircuitBreaker.Type.MEMORY, CircuitBreaker.Durability.TRANSIENT
+        );
+        final CircuitBreakerService service = new HierarchyCircuitBreakerService(
+            Settings.EMPTY,
+            Collections.singletonList(customBreaker),
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+        );
+        CircuitBreakerStats stats = service.stats("custom_breaker");
+        assertEquals("custom_breaker", stats.getName());
+        assertEquals(2048, stats.getLimit());
+        assertEquals(0, stats.getEstimated());
+        assertEquals(0, stats.getTrippedCount());
     }
 }

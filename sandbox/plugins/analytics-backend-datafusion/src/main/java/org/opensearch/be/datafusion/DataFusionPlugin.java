@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
 import org.opensearch.be.datafusion.action.DataFusionStatsAction;
+import org.opensearch.be.datafusion.nativelib.NativeBridge;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
@@ -20,6 +21,8 @@ import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.indices.breaker.CircuitBreakerStats;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
@@ -27,7 +30,9 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.exec.EngineReaderManager;
+import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.plugins.ActionPlugin;
+import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchBackEndPlugin;
 import org.opensearch.repositories.RepositoriesService;
@@ -54,7 +59,7 @@ import io.substrait.extension.SimpleExtension;
  * Analytics query capabilities are declared in {@link DataFusionAnalyticsBackendPlugin},
  * which is SPI-discovered and receives this plugin instance via its constructor.
  */
-public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<DatafusionReader>, AnalyticsSearchBackendPlugin, ActionPlugin {
+public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<DatafusionReader>, AnalyticsSearchBackendPlugin, ActionPlugin, CircuitBreakerPlugin {
 
     private static final Logger logger = LogManager.getLogger(DataFusionPlugin.class);
 
@@ -105,6 +110,7 @@ public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<Data
     private static final String SUPPORTED_FORMAT = "parquet";
 
     private volatile DataFusionService dataFusionService;
+    private volatile CircuitBreaker nativeBreaker;
     private volatile DataFormatRegistry dataFormatRegistry;
     private volatile SimpleExtension.ExtensionCollection substraitExtensions;
     private volatile ClusterService clusterService;
@@ -265,6 +271,24 @@ public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<Data
             return Collections.emptyList();
         }
         return List.of(new DataFusionStatsAction(dataFusionService));
+    }
+
+    @Override
+    public BreakerSettings getCircuitBreaker(Settings settings) {
+        long limit = DATAFUSION_MEMORY_POOL_LIMIT.get(settings);
+        return new BreakerSettings("native_request", limit, 1.0, CircuitBreaker.Type.MEMORY, CircuitBreaker.Durability.TRANSIENT, () -> {
+            long[] stats = NativeBridge.getBreakerStats();
+            long currentLimit = nativeBreaker != null ? nativeBreaker.getLimit() : limit;
+            if (stats == null) {
+                return new CircuitBreakerStats("native_request", currentLimit, 0, 1.0, 0);
+            }
+            return new CircuitBreakerStats("native_request", currentLimit, stats[0], 1.0, stats[2] + stats[3]);
+        });
+    }
+
+    @Override
+    public void setCircuitBreaker(CircuitBreaker circuitBreaker) {
+        this.nativeBreaker = circuitBreaker;
     }
 
     @Override

@@ -252,7 +252,11 @@ abstract class AbstractDatafusionReduceSink implements ExchangeSink {
             return;
         }
         if (failure instanceof RuntimeException re) {
-            throw re;
+            Exception converted = org.opensearch.analytics.exec.NativeErrorConverter.convert(re);
+            if (converted instanceof RuntimeException rConverted) {
+                throw rConverted;
+            }
+            throw new RuntimeException(converted);
         }
         if (failure instanceof Error err) {
             throw err;

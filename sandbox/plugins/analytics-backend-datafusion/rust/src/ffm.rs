@@ -48,7 +48,9 @@ fn get_rt_manager() -> Result<Arc<RuntimeManager>, String> {
 #[no_mangle]
 pub extern "C" fn df_init_runtime_manager(cpu_threads: i32) {
     let mut guard = TOKIO_RUNTIME_MANAGER.write();
-    *guard = Some(Arc::new(RuntimeManager::new(cpu_threads as usize)));
+    let mgr = Arc::new(RuntimeManager::new(cpu_threads as usize));
+    crate::native_mem_stats::start_refresh_timer(mgr.io_runtime.handle());
+    *guard = Some(mgr);
 }
 
 #[no_mangle]
@@ -836,4 +838,58 @@ pub unsafe extern "C" fn df_execute_local_prepared_plan(session_ptr: i64) -> i64
     let query_context = crate::query_tracker::QueryTrackingContext::new(0, session.memory_pool());
     let handle = crate::api::QueryStreamHandle::new(wrapped, query_context);
     Ok(Box::into_raw(Box::new(handle)) as i64)
+}
+
+// ---------------------------------------------------------------------------
+// Circuit breaker FFM exports
+// ---------------------------------------------------------------------------
+
+/// Initialize the native circuit breaker and spawn the jemalloc refresh timer.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_init_circuit_breaker(
+    request_limit: i64,
+    node_limit: i64,
+    overhead_millionths: i64,
+) -> i64 {
+    crate::circuit_breaker::init(
+        request_limit as usize,
+        node_limit as usize,
+        overhead_millionths as u64,
+    ).map_err(|e| e.to_string())?;
+    Ok(0i64)
+}
+
+/// Get breaker stats. Java calls this periodically to sync stats.
+/// Writes 4 i64 values to out_ptr: [request_used, total_used, child_tripped, node_tripped]
+#[no_mangle]
+pub unsafe extern "C" fn df_get_breaker_stats(out_ptr: *mut i64) -> i64 {
+    match crate::circuit_breaker::get() {
+        Some(cb) => {
+            *out_ptr = cb.request_used_bytes() as i64;
+            *out_ptr.add(1) = cb.total_used_bytes() as i64;
+            *out_ptr.add(2) = cb.child_tripped() as i64;
+            *out_ptr.add(3) = cb.node_tripped() as i64;
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Dynamically update the request-level breaker limit.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_set_breaker_limit(limit: i64) -> i64 {
+    let cb = crate::circuit_breaker::get().ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    cb.set_request_limit(limit as usize);
+    Ok(0)
+}
+
+/// Dynamically update the node-level breaker limit.
+#[ffm_safe]
+#[no_mangle]
+pub extern "C" fn df_set_breaker_node_limit(limit: i64) -> i64 {
+    let cb = crate::circuit_breaker::get().ok_or_else(|| "circuit breaker not initialized".to_string())?;
+    cb.set_node_limit(limit as usize);
+    Ok(0)
 }
