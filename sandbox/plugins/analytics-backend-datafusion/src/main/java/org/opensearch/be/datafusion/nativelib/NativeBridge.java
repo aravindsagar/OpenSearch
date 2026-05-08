@@ -384,8 +384,8 @@ public final class NativeBridge {
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
         );
         REGISTER_STATS_CALLBACK = linker.downcallHandle(
-            lib.find("df_register_stats_callback").orElseThrow(),
-            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)
+            lib.find("df_get_breaker_stats").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS)
         );
         SET_BREAKER_LIMIT = linker.downcallHandle(
             lib.find("df_set_breaker_limit").orElseThrow(),
@@ -1051,17 +1051,20 @@ public final class NativeBridge {
         }
     }
 
-    /** Register the stats-push callback so Rust can update Java-side breaker stats. */
-    public static void registerStatsCallback(java.lang.invoke.MethodHandle callback) {
-        try {
-            var stub = java.lang.foreign.Linker.nativeLinker().upcallStub(
-                callback,
-                FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG),
-                java.lang.foreign.Arena.global()
-            );
-            NativeCall.invokeVoid(REGISTER_STATS_CALLBACK, stub);
+    /** Poll breaker stats from Rust. Returns [requestUsed, totalUsed, childTripped, nodeTripped] or null if not initialized. */
+    public static long[] getBreakerStats() {
+        try (var arena = java.lang.foreign.Arena.ofConfined()) {
+            var buf = arena.allocate(ValueLayout.JAVA_LONG, 4);
+            long rc = (long) REGISTER_STATS_CALLBACK.invoke(buf);
+            if (rc != 0) return null;
+            return new long[] {
+                buf.getAtIndex(ValueLayout.JAVA_LONG, 0),
+                buf.getAtIndex(ValueLayout.JAVA_LONG, 1),
+                buf.getAtIndex(ValueLayout.JAVA_LONG, 2),
+                buf.getAtIndex(ValueLayout.JAVA_LONG, 3)
+            };
         } catch (Throwable t) {
-            throw new RuntimeException("Failed to register stats callback", t);
+            throw new RuntimeException("Failed to get breaker stats", t);
         }
     }
 

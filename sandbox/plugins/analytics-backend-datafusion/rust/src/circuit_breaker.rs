@@ -16,7 +16,7 @@
 //! A stats-push upcall notifies Java of current usage after every check.
 
 use std::fmt;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use log::{debug, error, warn};
@@ -24,10 +24,6 @@ use once_cell::sync::OnceCell;
 use tokio::runtime::Handle as TokioHandle;
 
 static BREAKER: OnceCell<NativeCircuitBreaker> = OnceCell::new();
-
-/// Upcall signature: (request_used_bytes: i64, total_used_bytes: i64, child_tripped: i64, node_tripped: i64)
-pub type StatsPushFn = unsafe extern "C" fn(i64, i64, i64, i64);
-static STATS_CALLBACK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Initialize the breaker and spawn the jemalloc refresh timer.
 /// `io_runtime` is used to spawn the background task.
@@ -66,11 +62,6 @@ pub fn init(request_limit: usize, node_limit: usize, overhead_millionths: u64, i
     Ok(())
 }
 
-/// Register the Java stats-push callback.
-pub fn register_stats_callback(fn_ptr: StatsPushFn) {
-    STATS_CALLBACK.store(fn_ptr as *mut (), Ordering::Release);
-}
-
 /// Get the breaker instance.
 pub fn get() -> Option<&'static NativeCircuitBreaker> {
     BREAKER.get()
@@ -91,7 +82,7 @@ pub struct NativeCircuitBreaker {
 }
 
 impl NativeCircuitBreaker {
-    /// Check both levels and reserve bytes. Pushes stats to Java after.
+    /// Check both levels and reserve bytes.
     pub fn check_and_reserve(&self, bytes: usize) -> Result<(), CircuitBreakError> {
         // Level 1: request check
         self.check_request(bytes)?;
@@ -102,15 +93,12 @@ impl NativeCircuitBreaker {
             return Err(e);
         }
 
-        // Push stats to Java
-        self.push_stats();
         Ok(())
     }
 
     /// Release bytes (called on shrink).
     pub fn release(&self, bytes: usize) {
         self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.push_stats();
     }
 
     /// Level 1: (request_used + bytes) × overhead > request_limit?
@@ -147,19 +135,22 @@ impl NativeCircuitBreaker {
         Ok(())
     }
 
-    /// Push current stats to Java via upcall (lightweight — just sets values).
-    fn push_stats(&self) {
-        let fn_ptr = STATS_CALLBACK.load(Ordering::Acquire);
-        if fn_ptr.is_null() { return; }
-        let callback: StatsPushFn = unsafe { std::mem::transmute(fn_ptr) };
-        unsafe {
-            callback(
-                self.request_used_bytes.load(Ordering::Relaxed) as i64,
-                self.cached_total_bytes.load(Ordering::Relaxed) as i64,
-                self.child_tripped.load(Ordering::Relaxed) as i64,
-                self.node_tripped.load(Ordering::Relaxed) as i64,
-            );
-        }
+    // --- Stats (polled by Java via FFM downcall) ---
+
+    pub fn request_used_bytes(&self) -> usize {
+        self.request_used_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn total_used_bytes(&self) -> usize {
+        self.cached_total_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn child_tripped(&self) -> u64 {
+        self.child_tripped.load(Ordering::Relaxed)
+    }
+
+    pub fn node_tripped(&self) -> u64 {
+        self.node_tripped.load(Ordering::Relaxed)
     }
 
     // --- Dynamic updates ---

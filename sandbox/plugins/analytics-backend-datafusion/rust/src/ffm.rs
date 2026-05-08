@@ -860,11 +860,20 @@ pub extern "C" fn df_init_circuit_breaker(
     Ok(0i64)
 }
 
-/// Register the Java stats-push callback.
-/// Signature: (request_used: i64, total_used: i64, child_tripped: i64, node_tripped: i64)
+/// Get breaker stats. Java calls this periodically to sync stats.
+/// Writes 4 i64 values to out_ptr: [request_used, total_used, child_tripped, node_tripped]
 #[no_mangle]
-pub unsafe extern "C" fn df_register_stats_callback(callback: crate::circuit_breaker::StatsPushFn) {
-    crate::circuit_breaker::register_stats_callback(callback);
+pub unsafe extern "C" fn df_get_breaker_stats(out_ptr: *mut i64) -> i64 {
+    match crate::circuit_breaker::get() {
+        Some(cb) => {
+            *out_ptr = cb.request_used_bytes() as i64;
+            *out_ptr.add(1) = cb.total_used_bytes() as i64;
+            *out_ptr.add(2) = cb.child_tripped() as i64;
+            *out_ptr.add(3) = cb.node_tripped() as i64;
+            0
+        }
+        None => -1,
+    }
 }
 
 /// Dynamically update the request-level breaker limit.
