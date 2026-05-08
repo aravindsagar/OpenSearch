@@ -102,15 +102,15 @@ impl NativeCircuitBreaker {
             return Err(e);
         }
 
-        // Push stats to Java
-        self.push_stats();
+        // Stats push disabled for this benchmark config
+        // self.push_stats();
         Ok(())
     }
 
     /// Release bytes (called on shrink).
     pub fn release(&self, bytes: usize) {
         self.request_used_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.push_stats();
+        // self.push_stats();
     }
 
     /// Level 1: (request_used + bytes) × overhead > request_limit?
