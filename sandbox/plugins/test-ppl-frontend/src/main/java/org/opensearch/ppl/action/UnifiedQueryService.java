@@ -91,7 +91,13 @@ public class UnifiedQueryService {
             // Log what the context's root schema looks like
             logger.info("[UnifiedQueryService] Context built, planning PPL: {}", pplText);
             UnifiedQueryPlanner planner = new UnifiedQueryPlanner(context);
-            RelNode logicalPlan = planner.plan(pplText);
+            RelNode logicalPlan;
+            // Synchronize planning: DatetimeUdtNormalizeRule.INSTANCE uses a non-thread-safe
+            // ArrayDeque stack (inherited from RelShuttleImpl). Concurrent plan() calls corrupt it.
+            // TODO: Fix upstream in unified-query-api to use per-invocation shuttle instances.
+            synchronized (UnifiedQueryService.class) {
+                logicalPlan = planner.plan(pplText);
+            }
 
             // Execute directly via the back-end engine — no Janino compilation needed.
             // The executor API is async; this test frontend keeps a sync surface, so we bridge

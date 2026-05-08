@@ -14,7 +14,7 @@ On Amazon OpenSearch Service, JVM heap is pre-allocated at startup (`-Xms == -Xm
 Instance RAM (e.g., 64 GB)
 ├── JVM Heap: 32 GB (fixed, pre-allocated, managed by GC)
 │    └── Existing circuit breakers protect this
-├── OS File Cache: variable (critical for search performance)
+├── OS File Cache: variable
 │    └── Must not be starved by native allocations
 ├── Native Budget: conservative (default: 25% of JVM max heap ≈ 8 GB)
 │    └── Rust/DataFusion allocations live here
@@ -22,19 +22,41 @@ Instance RAM (e.g., 64 GB)
 └── OS/kernel overhead: ~2 GB
 ```
 
-The native budget is intentionally conservative because OpenSearch depends on the OS file system cache being resident in RAM for read performance. Setting native memory too high would evict cached file pages and degrade search latency.
-
 These are **independent memory pools**. JVM heap pressure doesn't affect native memory availability and vice versa. Each pool needs its own protection, with its own limits.
 
 ## 3. Requirements
 
-The native circuit breaker must:
+Taking a look at the existing Java-side Circuit breaker is useful to understand what we need to implement for Native memory circuit breaker.
 
-1. **Reject queries that consume too much native memory** — prevent a single query (or the sum of all queries) from exhausting the native budget
-2. **Track actual native memory usage** — not just what DataFusion operators declare, but total Rust-side allocations (via jemalloc)
-3. **Expose stats** — operators must see native breaker stats in `_nodes/stats` alongside existing breakers
-4. **Be configurable** — limits must be adjustable via cluster settings
-5. **Add minimal overhead** — benchmarked at <10% latency impact
+### 3.1 How Java Circuit Breakers Work
+
+OpenSearch's existing circuit breakers protect the JVM heap from OOM crashes. The hierarchy:
+
+```
+Parent Breaker (95% of JVM max heap in real-memory mode)
+ ├── request      (60% of heap) — tracks memory used by search/aggregation operations
+ ├── fielddata    (40% of heap) — tracks field data cache
+ ├── in_flight    (100% of heap) — tracks in-flight network requests
+ └── [custom]     (via CircuitBreakerPlugin)
+```
+
+**How it trips:** When an operation allocates memory, it calls `addEstimateBytesAndMaybeBreak(bytes)` on the relevant child breaker. The child uses a CAS loop to atomically increment its `used` counter. If `used × overhead > limit`, it trips. After the child check passes, `checkParentLimit()` is called — in real-memory mode, this checks actual JVM heap usage (via `ManagementFactory.getMemoryMXBean()`) against 95% of max heap.
+
+**Key properties:**
+- Child breakers track **total** memory across all concurrent operations (not per-request)
+- The parent breaker provides a node-level safety net using actual heap usage
+- Stats are exposed via `GET _nodes/stats/breaker` (limit, estimated usage, tripped count)
+- Limits are dynamically configurable via cluster settings
+
+### 3.2 Native CB requirements
+
+The native circuit breaker must provide equivalent protection for Rust-side memory:
+
+1. **Reject queries from consuming too much native memory** — analogous to the `request` child breaker, but tracking Rust allocations instead of JVM heap
+2. **Track actual native memory usage** — analogous to the parent's real-memory mode, but using jemalloc stats instead of JVM MemoryMXBean
+3. **Expose stats** — native breaker must appear in `_nodes/stats` alongside existing breakers, with the same fields (limit, estimated usage, tripped count)
+4. **Be configurable** — limits must be adjustable via cluster settings, same as existing breakers
+5. **Add minimal overhead** — benchmarked at <10% latency impact (Java CB overhead is negligible due to simple CAS operations; native CB must match this)
 
 ## 4. Design
 
@@ -42,12 +64,12 @@ The native circuit breaker must:
 
 Every DataFusion memory allocation (`QueryMemoryPool.try_grow(N)`) passes through two checks:
 
-**Level 1 — Request check (per-query budget):**
+**Level 1 — Request check (total query memory budget):**
 ```
-(sum of all active query reservations + N) × overhead > request_limit?
+(total memory reserved by all active queries + N) × overhead > request_limit?
 ```
-- Prevents queries from consuming more than their allotted share
-- Analogous to Java's `request` breaker (60% of heap)
+- Prevents the combined memory of all concurrent queries from exceeding the allotted budget
+- Analogous to Java's `request` breaker (60% of heap) — which also tracks total across all requests, not per-request
 - Mechanism: atomic Compare-And-Swap (lock-free, ~5ns)
 
 **Level 2 — Node check (total native memory):**
@@ -60,20 +82,7 @@ jemalloc_total_allocated + N > node_limit?
 
 If either check fails, the allocation is rejected with a `CircuitBreakingException` (HTTP 429).
 
-### 4.2 Stats Push (Java Upcall)
-
-After every DataFusion memory allocation call (whether it trips or not), Rust pushes current stats to Java via a lightweight FFM upcall:
-
-```
-Rust check_and_reserve(N):
-  1. Level 1 check (CAS)
-  2. Level 2 check (cached jemalloc comparison)
-  3. Push stats to Java → sets request_used_bytes and tripped counts in Java child breaker
-```
-
-The upcall simply writes values into the Java-side `ChildMemoryCircuitBreaker` — no `checkParentLimit`, no FFM downcall back to Rust. This gives real-time stats visibility in `_nodes/stats` without any expensive operations.
-
-### 4.3 jemalloc Stats Caching
+### 4.2 jemalloc Stats Caching
 
 Reading jemalloc stats requires `epoch.advance()` which costs ~1-10μs — too expensive per allocation. A background Tokio task refreshes the cached value every 1 second:
 
@@ -88,15 +97,15 @@ Rust (spawned on IO runtime during df_init_circuit_breaker):
 ```
 
 The Level 2 check reads this cached value. Staleness of up to 1 second is acceptable because:
-- Level 1 (request check) runs in real-time on every allocation — catches per-query overuse immediately
+- Level 1 (request check) runs in real-time on every allocation — catches overuse immediately
 - Total native memory changes gradually (not in single-allocation bursts)
 - The `GreedyMemoryPool` hard ceiling remains as a safety net below the breaker
 
 **Resilience:** The background task runs in an infinite loop with `catch_unwind` around the jemalloc call. If `epoch.advance()` panics or returns an error, the loop logs the failure and retries on the next tick — it never exits. If jemalloc is permanently unavailable, the cached value stays at 0 and Level 2 effectively becomes a no-op. The system degrades gracefully: Level 1 (CAS) + `GreedyMemoryPool` still provide protection.
 
-### 4.4 Stats Visibility
+### 4.3 Stats Visibility
 
-OpenSearch exposes circuit breaker stats via `GET _nodes/stats/breaker`. Each registered breaker reports `limit_size_in_bytes`, `estimated_size_in_bytes` (current usage), `overhead`, and `tripped` count. To make native memory visible here, we use the existing `CircuitBreakerPlugin` extension point.
+OpenSearch exposes circuit breaker stats via `GET _nodes/stats/breaker`. Each registered breaker reports `limit_size_in_bytes`, `estimated_size_in_bytes` (current usage), `overhead`, and `tripped` count. To make native memory visible here, we use the existing `CircuitBreakerPlugin` extension point combined with a Java-side polling timer.
 
 **How it works:**
 
@@ -104,13 +113,15 @@ OpenSearch exposes circuit breaker stats via `GET _nodes/stats/breaker`. Each re
 
 2. **Callback:** The service calls `plugin.setCircuitBreaker(breaker)` back on the plugin, giving it a reference to the created `ChildMemoryCircuitBreaker` instance.
 
-3. **Stats push:** The plugin registers a lightweight FFM upcall with Rust. After every `check_and_reserve`/`release` in Rust, this upcall fires and updates the Java-side `ChildMemoryCircuitBreaker`'s internal counter via `addWithoutBreaking(delta)`. This keeps the Java breaker's `getUsed()` in real-time sync with Rust's `request_used_bytes`.
+3. **Stats sync:** The plugin starts a `ScheduledExecutorService` (1-second interval) that calls `NativeBridge.getBreakerStats()` — an FFM downcall to Rust that returns `[request_used_bytes, total_used_bytes, child_tripped, node_tripped]`. The timer computes the delta and calls `addWithoutBreaking(delta)` on the Java child breaker, and increments the tripped counter for any new trips.
 
-4. **Result:** When `_nodes/stats` is requested, the service iterates all breakers (including `native_request`), calls `getUsed()` on each, and renders the stats. The `native_request` breaker reports real-time Rust memory usage without any additional FFM call at stats-read time.
+4. **Result:** When `_nodes/stats` is requested, the service iterates all breakers (including `native_request`), calls `getUsed()` on each, and renders the stats. Stats may lag by up to 1 second, which is acceptable for monitoring.
 
-**Note:** The `ChildMemoryCircuitBreaker` created by the service has `addEstimateBytesAndMaybeBreak` available, but nothing on the Java side calls it — all enforcement happens in Rust. The Java-side breaker is purely a stats container whose counter is kept in sync by the upcall.
+**Note:** The Java-side breaker is purely a stats container — all enforcement happens in Rust. Nothing on the Java side calls `addEstimateBytesAndMaybeBreak`.
 
-### 4.5 Error Propagation
+**Why polling instead of push:** FFM upcalls can only be called from threads attached to the JVM. Rust Tokio worker threads are not attached, so calling an upcall from `check_and_reserve` crashes the JVM. The polling approach avoids this — the FFM downcall originates from a Java thread and is always safe.
+
+### 4.4 Error Propagation
 
 When the breaker trips, Rust encodes the error as:
 ```
@@ -157,24 +168,24 @@ Entry point `check_and_reserve(bytes)`:
 1. Level 1: `fetch_update` CAS on `request_used_bytes`
 2. Level 2: `cached_total_bytes + bytes > node_limit?`
 3. On failure at either level: roll back Level 1 reservation, return error
-4. Push stats to Java via upcall (sets current `request_used_bytes` and trip counts in Java child breaker)
 
-`release(bytes)`: decrements `request_used_bytes` (called on `shrink`). Also pushes updated stats to Java.
+`release(bytes)`: decrements `request_used_bytes` (called on `shrink`).
 
 ### Java (`DataFusionPlugin`)
 
 - Implements `CircuitBreakerPlugin` → registers `native_request` child breaker
-- `setCircuitBreaker(breaker)` → stores reference to the `ChildMemoryCircuitBreaker`
-- Registers a stats-push upcall callback that Rust calls after every `check_and_reserve`/`release`:
+- `setCircuitBreaker(breaker)` → stores reference, starts stats-sync timer
+- Stats-sync timer (1s `ScheduledExecutorService`):
+  - Calls `NativeBridge.getBreakerStats()` (FFM downcall → Rust returns stats struct)
   - Computes delta from last known value, calls `addWithoutBreaking(delta)` on the Java child breaker
-  - This keeps `_nodes/stats` in real-time sync with Rust
+  - Syncs tripped count via `circuitBreak()` calls for each new trip
 
 ### FFM Bridge
 
 | Function | Called by | Purpose |
 |----------|-----------|---------|
 | `df_init_circuit_breaker(request_limit, node_limit, overhead)` | Startup | Initialize breaker + spawn jemalloc refresh timer on IO runtime |
-| `df_register_stats_callback(fn_ptr)` | Startup | Register Java upcall for real-time stats push |
+| `df_get_breaker_stats(out_ptr)` | Java stats-sync timer (1s) | Returns `[request_used, total_used, child_tripped, node_tripped]` |
 | `df_set_breaker_limit(limit)` | Cluster setting change | Update request_limit |
 | `df_set_breaker_node_limit(limit)` | Cluster setting change | Update node_limit |
 
