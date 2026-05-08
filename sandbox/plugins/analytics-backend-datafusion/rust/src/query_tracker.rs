@@ -88,9 +88,10 @@ impl MemoryPool for QueryMemoryPool {
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.track_shrink(shrink);
         self.inner.shrink(reservation, shrink);
-        if let Some(cb) = crate::circuit_breaker::get() {
-            cb.release(shrink);
-        }
+        // CB DISABLED for baseline
+        // if let Some(cb) = crate::circuit_breaker::get() {
+        //     cb.release(shrink);
+        // }
     }
 
     fn try_grow(
@@ -98,11 +99,11 @@ impl MemoryPool for QueryMemoryPool {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> Result<(), DataFusionError> {
-        // Circuit breaker check (Level 1 + Level 2 + stats push)
-        if let Some(cb) = crate::circuit_breaker::get() {
-            cb.check_and_reserve(additional)
-                .map_err(|e| DataFusionError::ResourcesExhausted(e.to_encoded_string()))?;
-        }
+        // Circuit breaker DISABLED for baseline benchmark
+        // if let Some(cb) = crate::circuit_breaker::get() {
+        //     cb.check_and_reserve(additional)
+        //         .map_err(|e| DataFusionError::ResourcesExhausted(e.to_encoded_string()))?;
+        // }
         // Global pool hard ceiling (safety net)
         match self.inner.try_grow(reservation, additional) {
             Ok(()) => {
