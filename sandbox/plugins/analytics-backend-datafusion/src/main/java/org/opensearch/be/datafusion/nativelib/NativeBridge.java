@@ -76,6 +76,10 @@ public final class NativeBridge {
     private static final MethodHandle CACHE_MANAGER_GET_MEMORY_BY_TYPE;
     private static final MethodHandle CACHE_MANAGER_GET_TOTAL_MEMORY;
     private static final MethodHandle CACHE_MANAGER_CONTAINS_BY_TYPE;
+    private static final MethodHandle INIT_CIRCUIT_BREAKER;
+    private static final MethodHandle REGISTER_STATS_CALLBACK;
+    private static final MethodHandle SET_BREAKER_LIMIT;
+    private static final MethodHandle SET_BREAKER_NODE_LIMIT;
     private static final MethodHandle CREATE_SESSION_CONTEXT;
     private static final MethodHandle CREATE_SESSION_CONTEXT_INDEXED;
     private static final MethodHandle CLOSE_SESSION_CONTEXT;
@@ -375,6 +379,23 @@ public final class NativeBridge {
         // Hand the five filter-tree upcall stubs to Rust now. No explicit
         // caller step required — as soon as this class is loaded, callbacks
         // are installed and `df_execute_indexed_query` can dispatch into Java.
+        INIT_CIRCUIT_BREAKER = linker.downcallHandle(
+            lib.find("df_init_circuit_breaker").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+        REGISTER_STATS_CALLBACK = linker.downcallHandle(
+            lib.find("df_register_stats_callback").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)
+        );
+        SET_BREAKER_LIMIT = linker.downcallHandle(
+            lib.find("df_set_breaker_limit").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+        SET_BREAKER_NODE_LIMIT = linker.downcallHandle(
+            lib.find("df_set_breaker_node_limit").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+
         installFilterTreeCallbacks(linker);
 
         CLOSE_SESSION_CONTEXT = linker.downcallHandle(
@@ -1020,4 +1041,41 @@ public final class NativeBridge {
     }
 
     public static void initLogger() {}
+
+    // ---- Circuit breaker ----
+
+    /** Initialize the native circuit breaker and spawn jemalloc refresh timer. */
+    public static void initCircuitBreaker(long requestLimit, long nodeLimit, long overheadMillionths) {
+        try (var call = new NativeCall()) {
+            call.invoke(INIT_CIRCUIT_BREAKER, requestLimit, nodeLimit, overheadMillionths);
+        }
+    }
+
+    /** Register the stats-push callback so Rust can update Java-side breaker stats. */
+    public static void registerStatsCallback(java.lang.invoke.MethodHandle callback) {
+        try {
+            var stub = java.lang.foreign.Linker.nativeLinker().upcallStub(
+                callback,
+                FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG),
+                java.lang.foreign.Arena.global()
+            );
+            NativeCall.invokeVoid(REGISTER_STATS_CALLBACK, stub);
+        } catch (Throwable t) {
+            throw new RuntimeException("Failed to register stats callback", t);
+        }
+    }
+
+    /** Dynamically update the request-level breaker limit. */
+    public static void setBreakerLimit(long limit) {
+        try (var call = new NativeCall()) {
+            call.invoke(SET_BREAKER_LIMIT, limit);
+        }
+    }
+
+    /** Dynamically update the node-level breaker limit. */
+    public static void setBreakerNodeLimit(long limit) {
+        try (var call = new NativeCall()) {
+            call.invoke(SET_BREAKER_NODE_LIMIT, limit);
+        }
+    }
 }
