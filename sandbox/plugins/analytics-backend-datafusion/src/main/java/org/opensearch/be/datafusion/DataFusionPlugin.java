@@ -256,45 +256,69 @@ public class DataFusionPlugin extends Plugin implements SearchBackEndPlugin<Data
     public void setCircuitBreaker(CircuitBreaker circuitBreaker) {
         this.nativeBreaker = circuitBreaker;
         staticBreaker = circuitBreaker;
-        // Register the stats-push callback so Rust updates this breaker's counter in real-time
-        registerStatsCallback(circuitBreaker);
+        // Start a scheduled task to poll stats from Rust every second
+        startStatsSyncTimer();
     }
 
-    private static void registerStatsCallback(CircuitBreaker breaker) {
-        try {
-            var lookup = java.lang.invoke.MethodHandles.lookup();
-            // Static method that Rust calls: (requestUsed, totalUsed, childTripped, nodeTripped) -> void
-            var callback = lookup.findStatic(
-                DataFusionPlugin.class, "onStatsUpdate",
-                java.lang.invoke.MethodType.methodType(void.class, long.class, long.class, long.class, long.class)
-            );
-            NativeBridge.registerStatsCallback(callback);
-        } catch (Throwable t) {
-            throw new RuntimeException("Failed to register stats callback", t);
-        }
-    }
-
-    /** Upcall target: Rust pushes stats here after every check_and_reserve/release. */
     private static volatile CircuitBreaker staticBreaker;
     private static volatile long lastSyncedUsed = 0;
+    private static volatile long lastSyncedTripped = 0;
+    private static java.util.concurrent.ScheduledExecutorService statsSyncExecutor;
 
-    public static void onStatsUpdate(long requestUsed, long totalUsed, long childTripped, long nodeTripped) {
-        CircuitBreaker b = staticBreaker;
-        if (b == null) return;
-        long delta = requestUsed - lastSyncedUsed;
-        if (delta != 0) {
-            b.addWithoutBreaking(delta);
-            lastSyncedUsed = requestUsed;
-        }
+    private static void startStatsSyncTimer() {
+        statsSyncExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "native-cb-stats-sync");
+            t.setDaemon(true);
+            return t;
+        });
+        statsSyncExecutor.scheduleWithFixedDelay(() -> {
+            try {
+                long[] stats = NativeBridge.getBreakerStats();
+                if (stats == null) {
+                    logger.trace("getBreakerStats returned null");
+                    return;
+                }
+                CircuitBreaker b = staticBreaker;
+                if (b == null) {
+                    logger.trace("staticBreaker is null");
+                    return;
+                }
+                long requestUsed = stats[0];
+                long delta = requestUsed - lastSyncedUsed;
+                if (delta != 0) {
+                    b.addWithoutBreaking(delta);
+                    lastSyncedUsed = requestUsed;
+                }
+                // Sync tripped count: increment Java-side counter for each new trip
+                long totalTripped = stats[2] + stats[3]; // child + node tripped
+                long newTrips = totalTripped - lastSyncedTripped;
+                if (newTrips > 0) {
+                    logger.info("Native CB tripped {} new times (total={})", newTrips, totalTripped);
+                    for (long i = 0; i < newTrips; i++) {
+                        try {
+                            b.circuitBreak("native breaker tripped", totalTripped);
+                        } catch (Exception ignored) {
+                            // circuitBreak throws — we just want the counter increment
+                        }
+                    }
+                    lastSyncedTripped = totalTripped;
+                }
+            } catch (Exception e) {
+                logger.warn("Stats sync failed", e);
+            }
+        }, 1, 1, java.util.concurrent.TimeUnit.SECONDS);
     }
 
-    /** Returns the Java-side child breaker for native_request (used by DataFusionService for stats sync). */
+    /** Returns the Java-side child breaker for native_request. */
     CircuitBreaker getNativeBreaker() {
         return nativeBreaker;
     }
 
     @Override
     public void close() throws IOException {
+        if (statsSyncExecutor != null) {
+            statsSyncExecutor.shutdownNow();
+        }
         if (dataFusionService != null) {
             dataFusionService.close();
         }

@@ -153,6 +153,8 @@ public class DataFusionService extends AbstractLifecycleComponent {
      */
     public void setMemoryPoolLimit(long newLimitBytes) {
         NativeBridge.setMemoryPoolLimit(getNativeRuntime().get(), newLimitBytes);
+        NativeBridge.setBreakerLimit(newLimitBytes);
+        NativeBridge.setBreakerNodeLimit((long) (newLimitBytes * 1.5));
     }
 
     // Cache management (node-level, delegates to native runtime)
