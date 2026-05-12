@@ -66,6 +66,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.opensearch.indices.breaker.BreakerSettings.CIRCUIT_BREAKER_LIMIT_SETTING;
@@ -170,6 +171,7 @@ public class HierarchyCircuitBreakerService extends CircuitBreakerService {
 
     private final boolean trackRealMemoryUsage;
     private volatile BreakerSettings parentSettings;
+    private final Map<String, Supplier<CircuitBreakerStats>> statsSuppliers;
 
     // Tripped count for when redistribution was attempted but wasn't successful
     private final AtomicLong parentTripCount = new AtomicLong(0);
@@ -235,6 +237,13 @@ public class HierarchyCircuitBreakerService extends CircuitBreakerService {
             childCircuitBreakers.put(breakerSettings.getName(), validateAndCreateBreaker(breakerSettings));
         }
         this.breakers = Collections.unmodifiableMap(childCircuitBreakers);
+        HashMap<String, Supplier<CircuitBreakerStats>> suppliers = new HashMap<>();
+        for (BreakerSettings breakerSettings : customBreakers) {
+            if (breakerSettings.getStatsSupplier() != null) {
+                suppliers.put(breakerSettings.getName(), breakerSettings.getStatsSupplier());
+            }
+        }
+        this.statsSuppliers = Collections.unmodifiableMap(suppliers);
         this.parentSettings = new BreakerSettings(
             CircuitBreaker.PARENT,
             TOTAL_CIRCUIT_BREAKER_LIMIT_SETTING.get(settings).getBytes(),
@@ -337,6 +346,10 @@ public class HierarchyCircuitBreakerService extends CircuitBreakerService {
 
     @Override
     public CircuitBreakerStats stats(String name) {
+        Supplier<CircuitBreakerStats> supplier = statsSuppliers.get(name);
+        if (supplier != null) {
+            return supplier.get();
+        }
         CircuitBreaker breaker = this.breakers.get(name);
         return new CircuitBreakerStats(
             breaker.getName(),
